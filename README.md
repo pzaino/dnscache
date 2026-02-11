@@ -15,39 +15,45 @@ This tool is a simple DNS Cache system that can be used when you have a lot of D
 
 1. Clone the repository and navigate to the project directory:
 
-```bash
-git clone https://github.com/pzaino/dnscache
-cd dnscache
-```
+    ```bash
+    git clone https://github.com/pzaino/dnscache
+    cd dnscache
+    ```
 
 2. Build the project using Cargo:
 
-```bash
-cargo build --release
-```
+    ```bash
+    cargo build --release
+    ```
 
 3. Edit the configuration file `dnscache.toml` to set the cache duration and other parameters:
 
-```toml
-bind = "127.0.0.1:6363"
-upstream = "8.8.8.8:53"
-threads = 20
-upstream_timeout_secs = 2
-max_cache_ttl_secs = 3600
-cleanup_interval_secs = 120
-```
+    ```toml
+    bind = "127.0.0.1:6363"
+    upstream = "8.8.8.8:53"
+    threads = 20
+    upstream_timeout_secs = 2
+    max_cache_ttl_secs = 3600
+    cleanup_interval_secs = 120
+    ```
 
 4. Run the DNS Cache server:
 
-```bash
-./target/release/dnscache
-```
+    ```bash
+    ./target/release/dnscache
+    ```
 
 5. You can query the DNS Cache using `dig` or any DNS client:
 
-```bash
-dig @localhost -p 6363 example.com
-```
+    ```bash
+    dig @localhost -p 6363 example.com
+    ```
+
+6. To run system stress test use:
+
+    ```bash
+    ./tests/system_test.sh <FQDN>
+    ````
 
 ## License
 
