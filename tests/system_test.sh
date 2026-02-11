@@ -2,7 +2,11 @@
 
 SERVER="127.0.0.1"
 PORT="6363"
-FQDN="www.google.com"
+
+FQDN="$1"
+if [ -z "${FQDN}" ]; then
+    FQDN="www.google.com"
+fi
 
 TOTAL_REQUESTS=50000
 PARALLELISM=100
