@@ -1,0 +1,6 @@
+bind = "127.0.0.1:6363"
+upstream = "8.8.8.8:53"
+threads = 20
+upstream_timeout_secs = 2
+max_cache_ttl_secs = 3600
+cleanup_interval_secs = 120

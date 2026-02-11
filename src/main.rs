@@ -1,31 +1,49 @@
+use dnscache::config::Config;
+use dnscache::server::DnsCacheServer;
+
 use std::net::UdpSocket;
 use std::sync::Arc;
 use std::thread;
 
-use dnscache::server::DnsCacheServer;
-
 fn main() -> std::io::Result<()> {
-    let upstream = std::env::var("DNS_UPSTREAM").unwrap_or_else(|_| "8.8.8.8:53".to_string());
+    let config_path = std::env::args()
+        .nth(1)
+        .unwrap_or_else(|| "dnscache.toml".to_string());
 
-    // On macOS for dev: bind to 127.0.0.1:5353, since 53 is usually owned by mDNSResponder.
-    let bind_addr = std::env::var("DNS_BIND").unwrap_or_else(|_| "0.0.0.0:53".to_string());
+    let config = Config::load(&config_path).unwrap_or_default();
 
-    let socket = Arc::new(UdpSocket::bind(&bind_addr)?);
-    let srv = Arc::new(DnsCacheServer::new(upstream));
+    println!("Loaded config: {:?}", config);
 
-    let threads = num_cpus::get().max(1);
+    let socket = Arc::new(UdpSocket::bind(config.bind_addr())?);
+
+    let server = Arc::new(
+        DnsCacheServer::new(config.upstream())
+            .with_timeouts(config.upstream_timeout(), config.max_cache_ttl()),
+    );
+
+    // Start cleanup thread
+    server.start_cleanup_task(config.cleanup_interval());
+
+    // Start stats thread
+    server.start_stats_task();
+
+    let threads = config.threads().max(1);
+
+    println!("Starting dnscache with {} threads", threads);
 
     for _ in 0..threads {
         let sock = socket.clone();
-        let srv = srv.clone();
+        let srv = server.clone();
 
         thread::spawn(move || {
             let mut buf = [0u8; dnscache::server::MAX_PACKET_SIZE];
+
             loop {
                 let (size, src) = match sock.recv_from(&mut buf) {
                     Ok(v) => v,
                     Err(_) => continue,
                 };
+
                 srv.handle_request(&sock, &buf[..size], src);
             }
         });

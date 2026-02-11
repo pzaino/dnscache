@@ -3,4 +3,4 @@
 
 # Artifacts
 /target
-
+**/*.old
