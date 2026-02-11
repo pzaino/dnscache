@@ -1,6 +1,43 @@
-# IDEs
+# ===============================
+# IDE
+# ===============================
 .vscode/
+.idea/
 
-# Artifacts
+# ===============================
+# Rust build artifacts
+# ===============================
 /target
+**/target/
+
+# ===============================
+# Cargo fuzz build artifacts
+# ===============================
+fuzz/target/
+
+# ===============================
+# Fuzzing outputs (generated)
+# ===============================
+
+# Crash artifacts
+fuzz/artifacts/
+
+# Coverage / profiling output
+fuzz/coverage/
+fuzz/*.profraw
+fuzz/*.profdata
+
+# Temporary libFuzzer outputs
+fuzz/*.log
+
+# ===============================
+# Optional: Ignore fuzz corpus
+# ===============================
+# Uncomment if you do NOT want corpus in git
+fuzz/corpus/
+
+# ===============================
+# Misc
+# ===============================
 **/*.old
+.DS_Store

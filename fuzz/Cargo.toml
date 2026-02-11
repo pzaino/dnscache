@@ -1,0 +1,35 @@
+[package]
+name = "dnscache-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+[dependencies.dnscache]
+path = ".."
+
+[[bin]]
+name = "fuzz_target_1"
+path = "fuzz_targets/fuzz_target_1.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_handle"
+path = "fuzz_targets/fuzz_handle.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_cache_key"
+path = "fuzz_targets/fuzz_cache_key.rs"
+test = false
+doc = false
+bench = false
