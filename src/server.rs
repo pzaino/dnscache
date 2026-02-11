@@ -14,7 +14,8 @@ pub const MAX_CACHE_TTL_SECS: u32 = 86400;
 #[derive(Clone)]
 struct CacheEntry {
     response: Vec<u8>,
-    expires: Instant,
+    stored_at: Instant,
+    original_ttl: u32,
 }
 
 struct InFlight {
@@ -60,7 +61,9 @@ impl DnsCacheServer {
                 let mut removed = 0usize;
 
                 for entry in cache.iter() {
-                    if now >= entry.expires {
+                    //if now >= entry.expires {
+                    let elapsed = now.duration_since(entry.stored_at).as_secs();
+                    if elapsed < entry.original_ttl as u64 {
                         cache.remove(entry.key());
                         removed += 1;
                     }
@@ -123,11 +126,19 @@ impl DnsCacheServer {
 
         let now = Instant::now();
 
+        // Serving block (cache response)
         // Fast path: cache hit
         if let Some(entry) = self.cache.get(&key) {
-            if now < entry.expires {
+            //if now < entry.expires {
+            let elapsed = now.duration_since(entry.stored_at).as_secs();
+            if elapsed < entry.original_ttl as u64 {
                 let mut resp = entry.response.clone();
+
+                let remaining = entry.original_ttl.saturating_sub(elapsed as u32);
+
+                dns::rewrite_ttl(&mut resp, remaining);
                 dns::set_txid(&mut resp, txid);
+
                 let _ = listen_socket.send_to(&resp, src);
                 self.cache_hits.fetch_add(1, Ordering::Relaxed);
                 return;
@@ -160,13 +171,23 @@ impl DnsCacheServer {
             self.cache_misses.fetch_add(1, Ordering::Relaxed);
             // Do upstream work outside any locks
             if let Ok(response) = self.forward_to_upstream(request) {
-                let ttl = dns::extract_min_ttl(&response)
-                    .unwrap_or(DEFAULT_TTL_SECS)
-                    .min(self.max_cache_ttl);
+                let rcode = response[3] & 0x0F;
+                let ancount = u16::from_be_bytes([response[6], response[7]]);
+
+                let ttl = if rcode == 3 || ancount == 0 {
+                    // Negative caching
+                    dns::extract_negative_ttl(&response).unwrap_or(60) // safe fallback
+                } else {
+                    dns::extract_min_ttl(&response).unwrap_or(DEFAULT_TTL_SECS)
+                };
+
+                let ttl = ttl.min(self.max_cache_ttl);
 
                 self.cache.insert(key.clone(), CacheEntry {
                     response: response.clone(),
-                    expires: Instant::now() + Duration::from_secs(ttl as u64),
+                    //expires: Instant::now() + Duration::from_secs(ttl as u64),
+                    stored_at: Instant::now(),
+                    original_ttl: ttl,
                 });
 
                 let mut resp = response;

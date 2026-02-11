@@ -81,3 +81,144 @@ pub fn extract_min_ttl(response: &[u8]) -> Option<u32> {
         Some(min_ttl)
     }
 }
+
+/// Extract the negative TTL from the authority section's SOA record.
+pub fn extract_negative_ttl(response: &[u8]) -> Option<u32> {
+    if response.len() < 12 {
+        return None;
+    }
+
+    let nscount = u16::from_be_bytes([response[8], response[9]]) as usize;
+    if nscount == 0 {
+        return None;
+    }
+
+    let mut pos = 12;
+
+    // Skip question
+    while pos < response.len() && response[pos] != 0 {
+        let len = response[pos] as usize;
+        pos += 1 + len;
+    }
+    pos += 1 + 2 + 2;
+
+    for _ in 0..nscount {
+        if pos >= response.len() {
+            return None;
+        }
+
+        // Skip NAME
+        if response[pos] & 0xC0 == 0xC0 {
+            pos += 2;
+        } else {
+            while pos < response.len() && response[pos] != 0 {
+                let len = response[pos] as usize;
+                pos += 1 + len;
+            }
+            pos += 1;
+        }
+
+        if pos + 10 > response.len() {
+            return None;
+        }
+
+        let rr_type = u16::from_be_bytes([response[pos], response[pos + 1]]);
+        let ttl = u32::from_be_bytes([
+            response[pos + 4],
+            response[pos + 5],
+            response[pos + 6],
+            response[pos + 7],
+        ]);
+        let rdlen = u16::from_be_bytes([response[pos + 8], response[pos + 9]]) as usize;
+
+        pos += 10;
+
+        if rr_type == 6 {
+            // SOA record
+            let mut rpos = pos;
+
+            // Skip MNAME
+            while rpos < response.len() && response[rpos] != 0 {
+                let len = response[rpos] as usize;
+                rpos += 1 + len;
+            }
+            rpos += 1;
+
+            // Skip RNAME
+            while rpos < response.len() && response[rpos] != 0 {
+                let len = response[rpos] as usize;
+                rpos += 1 + len;
+            }
+            rpos += 1;
+
+            if rpos + 20 > response.len() {
+                return None;
+            }
+
+            // Skip SERIAL(4), REFRESH(4), RETRY(4), EXPIRE(4)
+            rpos += 16;
+
+            // MINIMUM field
+            let minimum = u32::from_be_bytes([
+                response[rpos],
+                response[rpos + 1],
+                response[rpos + 2],
+                response[rpos + 3],
+            ]);
+
+            return Some(minimum.min(ttl));
+        }
+
+        pos += rdlen;
+    }
+
+    None
+}
+
+/// Rewrite TTLs in all answer RRs to new_ttl.
+pub fn rewrite_ttl(response: &mut [u8], new_ttl: u32) {
+    if response.len() < 12 {
+        return;
+    }
+
+    let ancount = u16::from_be_bytes([response[6], response[7]]) as usize;
+    if ancount == 0 {
+        return;
+    }
+
+    let mut pos = 12;
+
+    // Skip question
+    while pos < response.len() && response[pos] != 0 {
+        let len = response[pos] as usize;
+        pos += 1 + len;
+    }
+    pos += 1 + 2 + 2;
+
+    for _ in 0..ancount {
+        if pos >= response.len() {
+            return;
+        }
+
+        if response[pos] & 0xC0 == 0xC0 {
+            pos += 2;
+        } else {
+            while pos < response.len() && response[pos] != 0 {
+                let len = response[pos] as usize;
+                pos += 1 + len;
+            }
+            pos += 1;
+        }
+
+        if pos + 10 > response.len() {
+            return;
+        }
+
+        // Overwrite TTL field
+        response[pos + 4..pos + 8].copy_from_slice(&new_ttl.to_be_bytes());
+
+        let rdlen = u16::from_be_bytes([response[pos + 8], response[pos + 9]]) as usize;
+
+        pos += 10 + rdlen;
+    }
+}
