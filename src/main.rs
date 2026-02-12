@@ -18,6 +18,8 @@ use std::sync::Arc;
 use std::thread;
 
 fn main() -> std::io::Result<()> {
+    println!("DNSCache by Paolo Fabio Zaino (c), all rights reserved, licensed under MPL 2.0");
+
     let config_path = std::env::args()
         .nth(1)
         .unwrap_or_else(|| "dnscache.toml".to_string());
