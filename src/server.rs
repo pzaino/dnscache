@@ -294,12 +294,15 @@ impl DnsCacheServer {
             // Do not cache zero-TTL responses
             if ttl > 0 {
                 let now = Instant::now();
-                self.cache.insert(key.clone(), CacheEntry {
-                    response: response.clone(),
-                    stored_at: now,
-                    original_ttl: ttl,
-                    expires_at: now + Duration::from_secs(ttl as u64),
-                });
+                self.cache.insert(
+                    key.clone(),
+                    CacheEntry {
+                        response: response.clone(),
+                        stored_at: now,
+                        original_ttl: ttl,
+                        expires_at: now + Duration::from_secs(ttl as u64),
+                    },
+                );
                 self.record_and_evict_if_needed(&key);
             }
 
@@ -345,7 +348,7 @@ impl DnsCacheServer {
         // leader failed and did not cache
         let mut resp = self.synthesize_servfail(request);
         dns::set_txid(&mut resp, txid);
-        return Some(resp);
+        Some(resp)
     }
 
     /// Handles all UDP requests. In production, this is called from the main loop for each received packet.
@@ -501,14 +504,14 @@ impl DnsCacheServer {
 
                 // TC bit set → retry over TCP
                 self.upstream_queries.fetch_add(1, Ordering::Relaxed);
-                return self.forward_via_tcp(request, upstream);
+                self.forward_via_tcp(request, upstream)
             }
 
             Err(_) => {
                 // UDP failed (timeout or network error)
                 // Retry once over TCP for resilience
                 self.upstream_queries.fetch_add(1, Ordering::Relaxed);
-                return self.forward_via_tcp(request, upstream);
+                self.forward_via_tcp(request, upstream)
             }
         }
     }
