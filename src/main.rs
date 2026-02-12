@@ -14,6 +14,8 @@ fn main() -> std::io::Result<()> {
 
     println!("Loaded config: {:?}", config);
 
+    println!("Upstream resolver: {}", config.primary_upstream());
+
     // ---- Bind UDP ----
     let udp_socket = Arc::new(UdpSocket::bind(config.bind_addr())?);
 
@@ -21,7 +23,7 @@ fn main() -> std::io::Result<()> {
     let tcp_listener = TcpListener::bind(config.bind_addr())?;
 
     let server = Arc::new(
-        DnsCacheServer::new(config.upstream())
+        DnsCacheServer::new(config.upstreams())
             .with_timeouts(config.upstream_timeout(), config.max_cache_ttl()),
     );
 

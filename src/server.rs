@@ -7,6 +7,9 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use std::collections::VecDeque;
+use std::sync::atomic::AtomicBool;
+
 use crate::dns;
 
 pub const MAX_PACKET_SIZE: usize = 4096;
@@ -28,9 +31,14 @@ struct InFlight {
 pub struct DnsCacheServer {
     cache: DashMap<Vec<u8>, CacheEntry>,
     inflight: DashMap<Vec<u8>, Arc<InFlight>>,
-    upstream: String,
+    upstreams: Vec<String>,
     upstream_timeout: Duration,
     max_cache_ttl: u32,
+
+    max_cache_entries: usize,
+    evict_queue: Mutex<VecDeque<Vec<u8>>>,
+    shutdown: AtomicBool,
+
     pub cache_hits: AtomicU64,
     pub cache_misses: AtomicU64,
     pub upstream_queries: AtomicU64,
@@ -38,13 +46,18 @@ pub struct DnsCacheServer {
 
 impl DnsCacheServer {
     /// Create a new server instance with the given upstream. In production, this is called once at startup.
-    pub fn new(upstream: String) -> Self {
+    pub fn new(upstreams: Vec<String>) -> Self {
         Self {
             cache: DashMap::new(),
             inflight: DashMap::new(),
-            upstream,
+            upstreams,
             upstream_timeout: Duration::from_secs(3),
             max_cache_ttl: MAX_CACHE_TTL_SECS,
+
+            max_cache_entries: 100_000,
+            evict_queue: Mutex::new(VecDeque::new()),
+            shutdown: AtomicBool::new(false),
+
             cache_hits: AtomicU64::new(0),
             cache_misses: AtomicU64::new(0),
             upstream_queries: AtomicU64::new(0),
@@ -54,21 +67,33 @@ impl DnsCacheServer {
     /// Periodically clean expired cache entries. In production, this runs in a background thread.
     pub fn start_cleanup_task(self: &Arc<Self>, interval: Duration) {
         let cache = self.cache.clone();
+        let srv = self.clone();
 
         thread::spawn(move || {
             loop {
+                if srv.should_shutdown() {
+                    break;
+                }
                 thread::sleep(interval);
+                if srv.should_shutdown() {
+                    break;
+                }
 
                 let now = Instant::now();
                 let mut removed = 0usize;
 
+                let mut to_remove = Vec::new();
+
                 for entry in cache.iter() {
-                    //if now >= entry.expires {
                     let elapsed = now.duration_since(entry.stored_at).as_secs();
                     if elapsed >= entry.original_ttl as u64 {
-                        cache.remove(entry.key());
-                        removed += 1;
+                        to_remove.push(entry.key().clone());
                     }
+                }
+
+                for key in to_remove {
+                    cache.remove(&key);
+                    removed += 1;
                 }
 
                 if removed > 0 {
@@ -84,7 +109,13 @@ impl DnsCacheServer {
 
         std::thread::spawn(move || {
             loop {
-                std::thread::sleep(std::time::Duration::from_secs(10));
+                if srv.should_shutdown() {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_secs(15));
+                if srv.should_shutdown() {
+                    break;
+                }
 
                 let hits = srv.cache_hits.load(Ordering::Relaxed);
                 let misses = srv.cache_misses.load(Ordering::Relaxed);
@@ -120,6 +151,15 @@ impl DnsCacheServer {
         }
 
         let txid = [request[0], request[1]];
+
+        // Enforce exactly one question
+        let qdcount = u16::from_be_bytes([request[4], request[5]]);
+        if qdcount != 1 {
+            let mut resp = self.synthesize_servfail(request);
+            dns::set_txid(&mut resp, txid);
+            return Some(resp);
+        }
+
         let key = dns::cache_key_from_request(request)?;
 
         let now = Instant::now();
@@ -142,33 +182,61 @@ impl DnsCacheServer {
         }
 
         // -------- In-flight Dedup --------
-        let inflight_entry = self
-            .inflight
-            .entry(key.clone())
-            .or_insert_with(|| {
-                Arc::new(InFlight {
-                    done: Mutex::new(false),
-                    cvar: Condvar::new(),
-                })
-            })
-            .clone();
+        let (inflight_entry, is_leader) = {
+            let entry = self.inflight.entry(key.clone());
 
-        let leader = Arc::ptr_eq(
-            &inflight_entry,
-            self.inflight
-                .get(&key)
-                .map(|v| v.clone())
-                .as_ref()
-                .unwrap_or(&inflight_entry),
-        );
+            match entry {
+                dashmap::mapref::entry::Entry::Occupied(e) => (e.get().clone(), false),
+                dashmap::mapref::entry::Entry::Vacant(v) => {
+                    let new = Arc::new(InFlight {
+                        done: Mutex::new(false),
+                        cvar: Condvar::new(),
+                    });
+                    v.insert(new.clone());
+                    (new, true)
+                }
+            }
+        };
 
-        if leader {
+        if is_leader {
             self.cache_misses.fetch_add(1, Ordering::Relaxed);
 
-            let response = self.forward_to_upstream(request).ok()?;
+            let response = match self.forward_to_upstream(request) {
+                Ok(r) => r,
+                Err(_) => {
+                    // Wake followers even on failure
+                    {
+                        let mut done = inflight_entry.done.lock().unwrap();
+                        *done = true;
+                        inflight_entry.cvar.notify_all();
+                    }
+                    self.inflight.remove(&key);
+
+                    // Synthesize SERVFAIL
+                    let mut resp = self.synthesize_servfail(request);
+                    dns::set_txid(&mut resp, txid);
+                    return Some(resp);
+                }
+            };
 
             let rcode = response[3] & 0x0F;
             let ancount = u16::from_be_bytes([response[6], response[7]]);
+
+            // Do not cache SERVFAIL, REFUSED, FORMERR, etc.
+            if rcode != 0 && rcode != 3 {
+                let mut resp = response;
+                dns::set_txid(&mut resp, txid);
+
+                // Wake followers
+                {
+                    let mut done = inflight_entry.done.lock().unwrap();
+                    *done = true;
+                    inflight_entry.cvar.notify_all();
+                }
+                self.inflight.remove(&key);
+
+                return Some(resp);
+            }
 
             let ttl = if rcode == 3 {
                 dns::extract_negative_ttl(&response).unwrap_or(60)
@@ -179,11 +247,15 @@ impl DnsCacheServer {
             }
             .min(self.max_cache_ttl);
 
-            self.cache.insert(key.clone(), CacheEntry {
-                response: response.clone(),
-                stored_at: Instant::now(),
-                original_ttl: ttl,
-            });
+            // Do not cache zero-TTL responses
+            if ttl > 0 {
+                self.cache.insert(key.clone(), CacheEntry {
+                    response: response.clone(),
+                    stored_at: Instant::now(),
+                    original_ttl: ttl,
+                });
+                self.record_and_evict_if_needed(&key);
+            }
 
             // Wake followers
             {
@@ -201,7 +273,14 @@ impl DnsCacheServer {
         // -------- Follower Path --------
         let mut done = inflight_entry.done.lock().unwrap();
         while !*done {
-            done = inflight_entry.cvar.wait(done).unwrap();
+            let (guard, timeout) = inflight_entry
+                .cvar
+                .wait_timeout(done, self.upstream_timeout)
+                .unwrap();
+            done = guard;
+            if timeout.timed_out() {
+                break;
+            }
         }
 
         if let Some(entry) = self.cache.get(&key) {
@@ -210,7 +289,10 @@ impl DnsCacheServer {
             return Some(resp);
         }
 
-        None
+        // leader failed and did not cache
+        let mut resp = self.synthesize_servfail(request);
+        dns::set_txid(&mut resp, txid);
+        return Some(resp);
     }
 
     /// Handles all UDP requests. In production, this is called from the main loop for each received packet.
@@ -259,31 +341,83 @@ impl DnsCacheServer {
         }
     }
 
-    /// Upstream forwarding used by production.
-    /// In tests, this can be mocked or called directly.
     pub fn forward_to_upstream(&self, request: &[u8]) -> std::io::Result<Vec<u8>> {
-        // ---- First try UDP ----
-        let sock = UdpSocket::bind("0.0.0.0:0")?;
-        sock.set_read_timeout(Some(self.upstream_timeout))?;
-        sock.send_to(request, &self.upstream)?;
-
-        self.upstream_queries.fetch_add(1, Ordering::Relaxed);
-
-        let mut buf = [0u8; MAX_PACKET_SIZE];
-        let (size, _) = sock.recv_from(&mut buf)?;
-        let response = buf[..size].to_vec();
-
-        // ---- If not truncated, return immediately ----
-        if response.len() >= 3 && (response[2] & 0x02) == 0 {
-            return Ok(response);
+        for upstream in &self.upstreams {
+            if let Ok(resp) = self.forward_single_upstream(request, upstream) {
+                return Ok(resp);
+            }
         }
 
-        // ---- TC bit set → retry via TCP ----
-        println!("Upstream response truncated, retrying over TCP");
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Other,
+            "All upstream resolvers failed",
+        ))
+    }
 
-        self.upstream_queries.fetch_add(1, Ordering::Relaxed);
+    /// Upstream forwarding (one server at the time).
+    /// In tests, this can be mocked or called directly.
+    pub fn forward_single_upstream(
+        &self,
+        request: &[u8],
+        upstream: &String,
+    ) -> std::io::Result<Vec<u8>> {
+        // ---- First try UDP ----
+        let udp_result = (|| -> std::io::Result<Vec<u8>> {
+            let sock = UdpSocket::bind("0.0.0.0:0")?;
+            sock.set_read_timeout(Some(self.upstream_timeout))?;
+            sock.send_to(request, upstream)?;
 
-        let mut stream = TcpStream::connect(&self.upstream)?;
+            self.upstream_queries.fetch_add(1, Ordering::Relaxed);
+
+            let mut buf = [0u8; MAX_PACKET_SIZE];
+            let (size, _) = sock.recv_from(&mut buf)?;
+
+            let response = buf[..size].to_vec();
+
+            if response.len() < dns::DNS_HEADER_LEN {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "Malformed upstream DNS response",
+                ));
+            }
+
+            // Validate TXID matches
+            if response.len() >= 2 {
+                if response[0] != request[0] || response[1] != request[1] {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "Upstream TXID mismatch",
+                    ));
+                }
+            }
+
+            self.validate_upstream_response(request, &response)?;
+            Ok(response)
+        })();
+
+        match udp_result {
+            Ok(response) => {
+                // If not truncated, return immediately
+                if response.len() >= 3 && (response[2] & 0x02) == 0 {
+                    return Ok(response);
+                }
+
+                // TC bit set → retry over TCP
+                self.upstream_queries.fetch_add(1, Ordering::Relaxed);
+                return self.forward_via_tcp(request, upstream);
+            }
+
+            Err(_) => {
+                // UDP failed (timeout or network error)
+                // Retry once over TCP for resilience
+                self.upstream_queries.fetch_add(1, Ordering::Relaxed);
+                return self.forward_via_tcp(request, upstream);
+            }
+        }
+    }
+
+    fn forward_via_tcp(&self, request: &[u8], upstream: &String) -> std::io::Result<Vec<u8>> {
+        let mut stream = TcpStream::connect(upstream)?;
         stream.set_read_timeout(Some(self.upstream_timeout))?;
         stream.set_write_timeout(Some(self.upstream_timeout))?;
 
@@ -297,9 +431,163 @@ impl DnsCacheServer {
         stream.read_exact(&mut len_buf)?;
         let msg_len = u16::from_be_bytes(len_buf) as usize;
 
+        if msg_len == 0 || msg_len > MAX_PACKET_SIZE {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "Invalid upstream TCP response length",
+            ));
+        }
+
         let mut tcp_buf = vec![0u8; msg_len];
         stream.read_exact(&mut tcp_buf)?;
 
+        if tcp_buf.len() < dns::DNS_HEADER_LEN {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "Malformed upstream TCP DNS response",
+            ));
+        }
+
+        // Validate TXID matches
+        if tcp_buf.len() >= 2 {
+            if tcp_buf[0] != request[0] || tcp_buf[1] != request[1] {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "Upstream TCP TXID mismatch",
+                ));
+            }
+        }
+
+        self.validate_upstream_response(request, &tcp_buf)?;
         Ok(tcp_buf)
+    }
+
+    /// Synthesize a SERVFAIL response based on the request. This is used when upstream resolution fails, and we want to return a valid DNS response indicating failure instead of just dropping the packet.
+    fn synthesize_servfail(&self, request: &[u8]) -> Vec<u8> {
+        let mut resp = request.to_vec();
+
+        if resp.len() < dns::DNS_HEADER_LEN {
+            return resp;
+        }
+
+        // QR = 1 (response)
+        resp[2] |= 0x80;
+
+        // Preserve RD automatically (copied from request)
+
+        // RA = 1 (recursion available)
+        resp[3] |= 0x80;
+
+        // Clear RCODE bits
+        resp[3] &= 0xF0;
+
+        // Set RCODE = 2 (SERVFAIL)
+        resp[3] |= 0x02;
+
+        // Zero ANCOUNT, NSCOUNT, ARCOUNT
+        resp[6] = 0;
+        resp[7] = 0;
+        resp[8] = 0;
+        resp[9] = 0;
+        resp[10] = 0;
+        resp[11] = 0;
+
+        resp
+    }
+
+    fn record_and_evict_if_needed(&self, key: &Vec<u8>) {
+        if self.max_cache_entries == 0 {
+            return;
+        }
+
+        let mut q = self.evict_queue.lock().unwrap();
+        q.push_back(key.clone());
+
+        // Evict until size is under cap. (We may pop keys that were already removed.)
+        while self.cache.len() > self.max_cache_entries {
+            if let Some(old_key) = q.pop_front() {
+                self.cache.remove(&old_key);
+            } else {
+                break;
+            }
+        }
+    }
+
+    pub fn request_shutdown(&self) {
+        self.shutdown.store(true, Ordering::Relaxed);
+    }
+
+    fn should_shutdown(&self) -> bool {
+        self.shutdown.load(Ordering::Relaxed)
+    }
+
+    fn validate_upstream_response(&self, request: &[u8], response: &[u8]) -> std::io::Result<()> {
+        if response.len() < dns::DNS_HEADER_LEN {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "Upstream response too short",
+            ));
+        }
+
+        // 1️ Validate QR bit (must be response)
+        if response[2] & 0x80 == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "Upstream packet is not a DNS response (QR=0)",
+            ));
+        }
+
+        // Validate OPCODE matches request
+        if (response[2] & 0x78) != (request[2] & 0x78) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "Upstream OPCODE mismatch",
+            ));
+        }
+
+        // Validate RD flag matches request
+        if (response[2] & 0x01) != (request[2] & 0x01) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "Upstream RD flag mismatch",
+            ));
+        }
+
+        // 2️ Validate Question Count (must match request)
+        let req_qdcount = u16::from_be_bytes([request[4], request[5]]);
+        let resp_qdcount = u16::from_be_bytes([response[4], response[5]]);
+
+        if req_qdcount != resp_qdcount {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "Upstream QDCOUNT mismatch",
+            ));
+        }
+
+        // 3️ Validate Question Section matches exactly
+        let req_question_end = dns::find_question_end(request).ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "Malformed request question section",
+            )
+        })?;
+
+        let resp_question_end = dns::find_question_end(response).ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "Malformed upstream question section",
+            )
+        })?;
+
+        if request[dns::DNS_HEADER_LEN..req_question_end]
+            != response[dns::DNS_HEADER_LEN..resp_question_end]
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "Upstream question section mismatch",
+            ));
+        }
+
+        Ok(())
     }
 }

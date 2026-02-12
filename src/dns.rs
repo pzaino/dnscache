@@ -222,3 +222,38 @@ pub fn rewrite_ttl(response: &mut [u8], new_ttl: u32) {
         pos += 10 + rdlen;
     }
 }
+
+pub fn find_question_end(packet: &[u8]) -> Option<usize> {
+    if packet.len() < DNS_HEADER_LEN {
+        return None;
+    }
+
+    let mut pos = DNS_HEADER_LEN;
+
+    // Walk QNAME labels
+    loop {
+        if pos >= packet.len() {
+            return None;
+        }
+
+        let len = packet[pos] as usize;
+        pos += 1;
+
+        if len == 0 {
+            break;
+        }
+
+        pos += len;
+
+        if pos > packet.len() {
+            return None;
+        }
+    }
+
+    // QTYPE (2 bytes) + QCLASS (2 bytes)
+    if pos + 4 > packet.len() {
+        return None;
+    }
+
+    Some(pos + 4)
+}

@@ -6,7 +6,7 @@ use std::time::Duration;
 #[derive(Debug, Deserialize, Default)]
 pub struct Config {
     pub bind: Option<String>,
-    pub upstream: Option<String>,
+    pub upstreams: Option<Vec<String>>,
     pub threads: Option<usize>,
     pub upstream_timeout_secs: Option<u64>,
     pub max_cache_ttl_secs: Option<u32>,
@@ -35,11 +35,21 @@ impl Config {
             .unwrap_or_else(|| "127.0.0.1:5353".to_string())
     }
 
-    pub fn upstream(&self) -> String {
-        self.upstream
-            .clone()
+    /// Returns the primary upstream resolver. If no upstreams are configured, returns a default of Google's public DNS.
+    pub fn primary_upstream(&self) -> String {
+        self.upstreams
+            .as_ref()
+            .and_then(|u| u.get(0).cloned())
             .or_else(|| Self::env_string("DNS_UPSTREAM"))
             .unwrap_or_else(|| "8.8.8.8:53".to_string())
+    }
+
+    /// Returns the list of upstreams, with the primary one first. If no upstreams are configured, returns a default list with Google's public DNS.
+    pub fn upstreams(&self) -> Vec<String> {
+        self.upstreams
+            .clone()
+            .or_else(|| Self::env_string("DNS_UPSTREAM").map(|u| vec![u]))
+            .unwrap_or_else(|| vec!["8.8.8.8:53".to_string(), "8.8.4.4:53".to_string()])
     }
 
     pub fn threads(&self) -> usize {

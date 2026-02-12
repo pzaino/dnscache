@@ -86,8 +86,9 @@ fn start_mock_upstream() -> (SocketAddr, Arc<AtomicUsize>) {
 fn cache_hit_avoids_upstream() {
     let (upstream_addr, hits) = start_mock_upstream();
 
-    let server =
-        DnsCacheServer::new(upstream_addr.to_string()).with_timeouts(Duration::from_secs(1), 3600);
+    let vec_upstreams = vec![upstream_addr.to_string()];
+
+    let server = DnsCacheServer::new(vec_upstreams).with_timeouts(Duration::from_secs(1), 3600);
 
     let listen = UdpSocket::bind("127.0.0.1:0").unwrap();
     listen
@@ -141,9 +142,10 @@ fn cache_hit_avoids_upstream() {
 fn inflight_dedup_under_concurrency() {
     let (upstream_addr, hits) = start_mock_upstream();
 
-    let server = Arc::new(
-        DnsCacheServer::new(upstream_addr.to_string()).with_timeouts(Duration::from_secs(1), 3600),
-    );
+    let vec_upstreams = vec![upstream_addr.to_string()];
+
+    let server =
+        Arc::new(DnsCacheServer::new(vec_upstreams).with_timeouts(Duration::from_secs(1), 3600));
 
     let listen = Arc::new(UdpSocket::bind("127.0.0.1:0").unwrap());
     listen
