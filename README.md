@@ -1,4 +1,4 @@
-# Simple DNS Cache in Rust
+# Simple and High-Performance DNS Caching resolver
 
 This tool is a simple DNS Cache system that can be used when you have a lot of DNS queries and want to reduce the latency by caching the results. It is implemented in Rust for performance and safety.
 
