@@ -62,3 +62,6 @@ This project is copyright (c) 2026 by Paolo Zaino, all rights reserved. It is li
 ## Contributing
 
 Contributions are welcome! If you have any ideas for improvements or want to report a bug, please open an issue or submit a pull request.
+
+Enjoy and happy caching!
+Paolo :)
