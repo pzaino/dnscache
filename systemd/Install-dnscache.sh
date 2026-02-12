@@ -17,6 +17,7 @@ MAX_REQUESTS="10000"
 RATE_WINDOW="1"
 MAX_CACHE_TTL="3600"
 MAX_CACHE_ENTRIES="200000"
+DNS_BIND="172.0.0.1:53"
 
 FORCE="false"
 DRY_RUN="false"
@@ -78,6 +79,10 @@ while true; do
       UPSTREAMS="$2"
       shift 2
       ;;
+    --bind)
+      DNS_BIND="$2"
+      shift 2
+      ;;
     --max-requests)
       MAX_REQUESTS="$2"
       shift 2
@@ -117,6 +122,7 @@ done
 # -----------------------------
 
 validate_upstreams "$UPSTREAMS"
+validate_upstreams "$DNS_BIND"
 
 is_positive_integer "$MAX_REQUESTS" || error "MAX_REQUESTS must be a positive integer"
 is_positive_integer "$RATE_WINDOW" || error "RATE_WINDOW must be a positive integer"
