@@ -102,10 +102,12 @@ fn cache_hit_avoids_upstream() {
 
     let vec_upstreams = vec![upstream_addr.to_string()];
 
-    let mut cfg = Config::default();
-    cfg.upstreams = Some(vec_upstreams);
-    cfg.upstream_timeout_secs = Some(1);
-    cfg.max_cache_ttl_secs = Some(3600);
+    let cfg = Config {
+        upstreams: Some(vec_upstreams),
+        upstream_timeout_secs: Some(1),
+        max_cache_ttl_secs: Some(3600),
+        ..Default::default()
+    };
 
     let server = DnsCacheServer::new(&cfg);
 
@@ -163,10 +165,12 @@ fn inflight_dedup_under_concurrency() {
 
     let vec_upstreams = vec![upstream_addr.to_string()];
 
-    let mut cfg = Config::default();
-    cfg.upstreams = Some(vec_upstreams);
-    cfg.upstream_timeout_secs = Some(1);
-    cfg.max_cache_ttl_secs = Some(3600);
+    let cfg = Config {
+        upstreams: Some(vec_upstreams),
+        upstream_timeout_secs: Some(1),
+        max_cache_ttl_secs: Some(3600),
+        ..Default::default()
+    };
 
     let server = Arc::new(DnsCacheServer::new(&cfg));
 
