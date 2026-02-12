@@ -55,7 +55,7 @@ impl Config {
     pub fn primary_upstream(&self) -> String {
         self.upstreams
             .as_ref()
-            .and_then(|u| u.get(0).cloned())
+            .and_then(|u| u.first().cloned())
             .or_else(|| Self::env_string("DNS_UPSTREAM"))
             .unwrap_or_else(|| "8.8.8.8:53".to_string())
     }

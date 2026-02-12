@@ -68,14 +68,12 @@ fn main() -> std::io::Result<()> {
     {
         let srv = server.clone();
         thread::spawn(move || {
-            for stream in tcp_listener.incoming() {
-                if let Ok(stream) = stream {
-                    let srv_clone = srv.clone();
+            for stream in tcp_listener.incoming().flatten() {
+                let srv_clone = srv.clone();
 
-                    thread::spawn(move || {
-                        srv_clone.handle_tcp_request(stream);
-                    });
-                }
+                thread::spawn(move || {
+                    srv_clone.handle_tcp_request(stream);
+                });
             }
         });
     }

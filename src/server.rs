@@ -282,9 +282,7 @@ impl DnsCacheServer {
                 return Some(resp);
             }
 
-            let ttl = if rcode == 3 {
-                dns::extract_negative_ttl(&response).unwrap_or(60)
-            } else if rcode == 0 && ancount == 0 {
+            let ttl = if rcode == 3 || (rcode == 0 && ancount == 0) {
                 dns::extract_negative_ttl(&response).unwrap_or(60)
             } else {
                 dns::extract_min_ttl(&response).unwrap_or(DEFAULT_TTL_SECS)
@@ -448,10 +446,7 @@ impl DnsCacheServer {
             }
         }
 
-        Err(std::io::Error::new(
-            std::io::ErrorKind::Other,
-            "All upstream resolvers failed",
-        ))
+        Err(std::io::Error::other("All upstream resolvers failed"))
     }
 
     /// Upstream forwarding (one server at the time).
@@ -482,13 +477,11 @@ impl DnsCacheServer {
             }
 
             // Validate TXID matches
-            if response.len() >= 2 {
-                if response[0] != request[0] || response[1] != request[1] {
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::InvalidData,
-                        "Upstream TXID mismatch",
-                    ));
-                }
+            if response.len() >= 2 && (response[0] != request[0] || response[1] != request[1]) {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "Upstream TXID mismatch",
+                ));
             }
 
             self.validate_upstream_response(request, &response)?;
@@ -549,13 +542,11 @@ impl DnsCacheServer {
         }
 
         // Validate TXID matches
-        if tcp_buf.len() >= 2 {
-            if tcp_buf[0] != request[0] || tcp_buf[1] != request[1] {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    "Upstream TCP TXID mismatch",
-                ));
-            }
+        if tcp_buf.len() >= 2 && (tcp_buf[0] != request[0] || tcp_buf[1] != request[1]) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "Upstream TCP TXID mismatch",
+            ));
         }
 
         self.validate_upstream_response(request, &tcp_buf)?;
@@ -601,7 +592,7 @@ impl DnsCacheServer {
         }
 
         let mut q = self.evict_queue.lock().unwrap();
-        q.push_back(key.clone());
+        q.push_back(key.to_owned());
 
         // Evict until size is under cap. (We may pop keys that were already removed.)
         while self.cache.len() > self.max_cache_entries {
