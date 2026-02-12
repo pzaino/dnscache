@@ -1,7 +1,7 @@
 use dnscache::config::Config;
 use dnscache::server::DnsCacheServer;
 
-use std::net::UdpSocket;
+use std::net::{TcpListener, UdpSocket};
 use std::sync::Arc;
 use std::thread;
 
@@ -14,25 +14,26 @@ fn main() -> std::io::Result<()> {
 
     println!("Loaded config: {:?}", config);
 
-    let socket = Arc::new(UdpSocket::bind(config.bind_addr())?);
+    // ---- Bind UDP ----
+    let udp_socket = Arc::new(UdpSocket::bind(config.bind_addr())?);
+
+    // ---- Bind TCP ----
+    let tcp_listener = TcpListener::bind(config.bind_addr())?;
 
     let server = Arc::new(
         DnsCacheServer::new(config.upstream())
             .with_timeouts(config.upstream_timeout(), config.max_cache_ttl()),
     );
 
-    // Start cleanup thread
     server.start_cleanup_task(config.cleanup_interval());
-
-    // Start stats thread
     server.start_stats_task();
 
     let threads = config.threads().max(1);
+    println!("Starting dnscache with {} UDP worker threads", threads);
 
-    println!("Starting dnscache with {} threads", threads);
-
+    // ---- UDP Workers ----
     for _ in 0..threads {
-        let sock = socket.clone();
+        let sock = udp_socket.clone();
         let srv = server.clone();
 
         thread::spawn(move || {
@@ -44,11 +45,28 @@ fn main() -> std::io::Result<()> {
                     Err(_) => continue,
                 };
 
-                srv.handle_request(&sock, &buf[..size], src);
+                srv.handle_udp_request(&sock, &buf[..size], src);
             }
         });
     }
 
+    // ---- TCP Accept Loop ----
+    {
+        let srv = server.clone();
+        thread::spawn(move || {
+            for stream in tcp_listener.incoming() {
+                if let Ok(stream) = stream {
+                    let srv_clone = srv.clone();
+
+                    thread::spawn(move || {
+                        srv_clone.handle_tcp_request(stream);
+                    });
+                }
+            }
+        });
+    }
+
+    // Keep main alive
     loop {
         thread::park();
     }

@@ -1,4 +1,6 @@
 use dashmap::DashMap;
+use std::io::{Read, Write};
+use std::net::TcpStream;
 use std::net::{SocketAddr, UdpSocket};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
@@ -7,7 +9,7 @@ use std::time::{Duration, Instant};
 
 use crate::dns;
 
-pub const MAX_PACKET_SIZE: usize = 512;
+pub const MAX_PACKET_SIZE: usize = 4096;
 pub const DEFAULT_TTL_SECS: u32 = 300;
 pub const MAX_CACHE_TTL_SECS: u32 = 86400;
 
@@ -63,7 +65,7 @@ impl DnsCacheServer {
                 for entry in cache.iter() {
                     //if now >= entry.expires {
                     let elapsed = now.duration_since(entry.stored_at).as_secs();
-                    if elapsed < entry.original_ttl as u64 {
+                    if elapsed >= entry.original_ttl as u64 {
                         cache.remove(entry.key());
                         removed += 1;
                     }
@@ -111,26 +113,21 @@ impl DnsCacheServer {
         self
     }
 
-    /// Main handler for a single UDP request.
-    /// In production, this is called by multiple threads concurrently. In tests, it can be called directly.
-    pub fn handle_request(&self, listen_socket: &UdpSocket, request: &[u8], src: SocketAddr) {
+    /// Core logic to process a DNS query. This is called by both UDP and TCP handlers, and can also be called directly in tests.
+    pub fn process_dns_query(&self, request: &[u8]) -> Option<Vec<u8>> {
         if request.len() < dns::DNS_HEADER_LEN {
-            return;
+            return None;
         }
 
         let txid = [request[0], request[1]];
-        let key = match dns::cache_key_from_request(request) {
-            Some(k) => k,
-            None => return,
-        };
+        let key = dns::cache_key_from_request(request)?;
 
         let now = Instant::now();
 
-        // Serving block (cache response)
-        // Fast path: cache hit
+        // -------- Cache Fast Path --------
         if let Some(entry) = self.cache.get(&key) {
-            //if now < entry.expires {
             let elapsed = now.duration_since(entry.stored_at).as_secs();
+
             if elapsed < entry.original_ttl as u64 {
                 let mut resp = entry.response.clone();
 
@@ -139,13 +136,12 @@ impl DnsCacheServer {
                 dns::rewrite_ttl(&mut resp, remaining);
                 dns::set_txid(&mut resp, txid);
 
-                let _ = listen_socket.send_to(&resp, src);
                 self.cache_hits.fetch_add(1, Ordering::Relaxed);
-                return;
+                return Some(resp);
             }
         }
 
-        // In-flight dedup
+        // -------- In-flight Dedup --------
         let inflight_entry = self
             .inflight
             .entry(key.clone())
@@ -157,7 +153,6 @@ impl DnsCacheServer {
             })
             .clone();
 
-        // Leader does upstream query, followers wait
         let leader = Arc::ptr_eq(
             &inflight_entry,
             self.inflight
@@ -169,31 +164,26 @@ impl DnsCacheServer {
 
         if leader {
             self.cache_misses.fetch_add(1, Ordering::Relaxed);
-            // Do upstream work outside any locks
-            if let Ok(response) = self.forward_to_upstream(request) {
-                let rcode = response[3] & 0x0F;
-                let ancount = u16::from_be_bytes([response[6], response[7]]);
 
-                let ttl = if rcode == 3 || ancount == 0 {
-                    // Negative caching
-                    dns::extract_negative_ttl(&response).unwrap_or(60) // safe fallback
-                } else {
-                    dns::extract_min_ttl(&response).unwrap_or(DEFAULT_TTL_SECS)
-                };
+            let response = self.forward_to_upstream(request).ok()?;
 
-                let ttl = ttl.min(self.max_cache_ttl);
+            let rcode = response[3] & 0x0F;
+            let ancount = u16::from_be_bytes([response[6], response[7]]);
 
-                self.cache.insert(key.clone(), CacheEntry {
-                    response: response.clone(),
-                    //expires: Instant::now() + Duration::from_secs(ttl as u64),
-                    stored_at: Instant::now(),
-                    original_ttl: ttl,
-                });
-
-                let mut resp = response;
-                dns::set_txid(&mut resp, txid);
-                let _ = listen_socket.send_to(&resp, src);
+            let ttl = if rcode == 3 {
+                dns::extract_negative_ttl(&response).unwrap_or(60)
+            } else if rcode == 0 && ancount == 0 {
+                dns::extract_negative_ttl(&response).unwrap_or(60)
+            } else {
+                dns::extract_min_ttl(&response).unwrap_or(DEFAULT_TTL_SECS)
             }
+            .min(self.max_cache_ttl);
+
+            self.cache.insert(key.clone(), CacheEntry {
+                response: response.clone(),
+                stored_at: Instant::now(),
+                original_ttl: ttl,
+            });
 
             // Wake followers
             {
@@ -202,17 +192,69 @@ impl DnsCacheServer {
                 inflight_entry.cvar.notify_all();
             }
             self.inflight.remove(&key);
-        } else {
-            // Follower: wait for leader
-            let mut done = inflight_entry.done.lock().unwrap();
-            while !*done {
-                done = inflight_entry.cvar.wait(done).unwrap();
+
+            let mut resp = response;
+            dns::set_txid(&mut resp, txid);
+            return Some(resp);
+        }
+
+        // -------- Follower Path --------
+        let mut done = inflight_entry.done.lock().unwrap();
+        while !*done {
+            done = inflight_entry.cvar.wait(done).unwrap();
+        }
+
+        if let Some(entry) = self.cache.get(&key) {
+            let mut resp = entry.response.clone();
+            dns::set_txid(&mut resp, txid);
+            return Some(resp);
+        }
+
+        None
+    }
+
+    /// Handles all UDP requests. In production, this is called from the main loop for each received packet.
+    pub fn handle_udp_request(&self, listen_socket: &UdpSocket, request: &[u8], src: SocketAddr) {
+        if let Some(response) = self.process_dns_query(request) {
+            let _ = listen_socket.send_to(&response, src);
+        }
+    }
+
+    /// Handles all TCP requests. In production, this is called from a thread pool worker for each accepted connection.
+    /// Note: this does handle multiple queries per request, but it does not handle pipelining or interleaving. It processes queries sequentially until the client disconnects.
+    pub fn handle_tcp_request(&self, mut stream: TcpStream) {
+        stream.set_read_timeout(Some(self.upstream_timeout)).ok();
+        stream.set_write_timeout(Some(self.upstream_timeout)).ok();
+
+        loop {
+            let mut len_buf = [0u8; 2];
+
+            if stream.read_exact(&mut len_buf).is_err() {
+                break;
             }
 
-            if let Some(entry) = self.cache.get(&key) {
-                let mut resp = entry.response.clone();
-                dns::set_txid(&mut resp, txid);
-                let _ = listen_socket.send_to(&resp, src);
+            let msg_len = u16::from_be_bytes(len_buf) as usize;
+
+            if msg_len == 0 || msg_len > 4096 {
+                break;
+            }
+
+            let mut buffer = vec![0u8; msg_len];
+
+            if stream.read_exact(&mut buffer).is_err() {
+                break;
+            }
+
+            if let Some(response) = self.process_dns_query(&buffer) {
+                let resp_len = (response.len() as u16).to_be_bytes();
+
+                if stream.write_all(&resp_len).is_err() {
+                    break;
+                }
+
+                if stream.write_all(&response).is_err() {
+                    break;
+                }
             }
         }
     }
@@ -220,6 +262,7 @@ impl DnsCacheServer {
     /// Upstream forwarding used by production.
     /// In tests, this can be mocked or called directly.
     pub fn forward_to_upstream(&self, request: &[u8]) -> std::io::Result<Vec<u8>> {
+        // ---- First try UDP ----
         let sock = UdpSocket::bind("0.0.0.0:0")?;
         sock.set_read_timeout(Some(self.upstream_timeout))?;
         sock.send_to(request, &self.upstream)?;
@@ -228,6 +271,35 @@ impl DnsCacheServer {
 
         let mut buf = [0u8; MAX_PACKET_SIZE];
         let (size, _) = sock.recv_from(&mut buf)?;
-        Ok(buf[..size].to_vec())
+        let response = buf[..size].to_vec();
+
+        // ---- If not truncated, return immediately ----
+        if response.len() >= 3 && (response[2] & 0x02) == 0 {
+            return Ok(response);
+        }
+
+        // ---- TC bit set → retry via TCP ----
+        println!("Upstream response truncated, retrying over TCP");
+
+        self.upstream_queries.fetch_add(1, Ordering::Relaxed);
+
+        let mut stream = TcpStream::connect(&self.upstream)?;
+        stream.set_read_timeout(Some(self.upstream_timeout))?;
+        stream.set_write_timeout(Some(self.upstream_timeout))?;
+
+        // Send length-prefixed DNS message
+        let len = (request.len() as u16).to_be_bytes();
+        stream.write_all(&len)?;
+        stream.write_all(request)?;
+
+        // Read response length
+        let mut len_buf = [0u8; 2];
+        stream.read_exact(&mut len_buf)?;
+        let msg_len = u16::from_be_bytes(len_buf) as usize;
+
+        let mut tcp_buf = vec![0u8; msg_len];
+        stream.read_exact(&mut tcp_buf)?;
+
+        Ok(tcp_buf)
     }
 }

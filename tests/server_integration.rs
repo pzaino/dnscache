@@ -112,7 +112,7 @@ fn cache_hit_avoids_upstream() {
             let mut buf = [0u8; 512];
             loop {
                 let (n, src) = sock.recv_from(&mut buf).unwrap();
-                srv.handle_request(&sock, &buf[..n], src);
+                srv.handle_udp_request(&sock, &buf[..n], src);
             }
         });
     }
@@ -159,7 +159,7 @@ fn inflight_dedup_under_concurrency() {
             let mut buf = [0u8; 512];
             loop {
                 let (n, src) = sock.recv_from(&mut buf).unwrap();
-                srv.handle_request(&sock, &buf[..n], src);
+                srv.handle_udp_request(&sock, &buf[..n], src);
             }
         });
     }
