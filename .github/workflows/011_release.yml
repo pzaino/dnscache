@@ -91,25 +91,32 @@ jobs:
         shell: bash
         run: |
           mkdir bundle
-          
-          # Binary path
+      
           BIN="target/${{ matrix.target }}/release/dnscache"
-          
           if [[ "${{ runner.os }}" == "Windows" ]]; then
             BIN="target/${{ matrix.target }}/release/dnscache.exe"
           fi
-
+      
           cp "$BIN" bundle/
           cp dnscache.toml bundle/
-
+      
           if [[ "${{ runner.os }}" == "Linux" ]]; then
             cp -r systemd bundle/
           fi
-
+      
+      - name: Create zip (Unix)
+        if: runner.os != 'Windows'
+        run: |
           cd bundle
           zip -r ../${{ matrix.zip }} .
           cd ..
 
+      - name: Create zip (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          Compress-Archive -Path bundle\* -DestinationPath ${{ matrix.zip }}
+        
       - name: Upload to release
         if: ${{ github.event.inputs.dry_run != 'true' }}
         uses: softprops/action-gh-release@v2
