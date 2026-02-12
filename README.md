@@ -15,6 +15,18 @@ This tool is a simple DNS Cache system that can be used when you have a lot of D
 - Provides a configuration file to customize the cache behavior and parameters.
 - Implements quite a few DNS verification checks to ensure the integrity of the cached data and prevent poisoning attacks.
 
+## Supported platforms
+
+- Linux
+- macOS
+- Windows
+- BSD (should build on both FreeBSD and NetBSD)
+
+CPU Architectures supported:
+
+- Tested on ARM64
+- Tested on x86_64
+
 ## Usage
 
 1. Clone the repository and navigate to the project directory:
