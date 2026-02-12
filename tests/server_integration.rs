@@ -1,4 +1,6 @@
+use dnscache::config::Config;
 use dnscache::server::DnsCacheServer;
+
 use std::net::{SocketAddr, UdpSocket};
 use std::sync::{
     Arc,
@@ -88,7 +90,12 @@ fn cache_hit_avoids_upstream() {
 
     let vec_upstreams = vec![upstream_addr.to_string()];
 
-    let server = DnsCacheServer::new(vec_upstreams).with_timeouts(Duration::from_secs(1), 3600);
+    let mut cfg = Config::default();
+    cfg.upstreams = Some(vec_upstreams);
+    cfg.upstream_timeout_secs = Some(1);
+    cfg.max_cache_ttl_secs = Some(3600);
+
+    let server = DnsCacheServer::new(&cfg);
 
     let listen = UdpSocket::bind("127.0.0.1:0").unwrap();
     listen
@@ -144,8 +151,12 @@ fn inflight_dedup_under_concurrency() {
 
     let vec_upstreams = vec![upstream_addr.to_string()];
 
-    let server =
-        Arc::new(DnsCacheServer::new(vec_upstreams).with_timeouts(Duration::from_secs(1), 3600));
+    let mut cfg = Config::default();
+    cfg.upstreams = Some(vec_upstreams);
+    cfg.upstream_timeout_secs = Some(1);
+    cfg.max_cache_ttl_secs = Some(3600);
+
+    let server = Arc::new(DnsCacheServer::new(&cfg));
 
     let listen = Arc::new(UdpSocket::bind("127.0.0.1:0").unwrap());
     listen

@@ -9,8 +9,11 @@ pub struct Config {
     pub upstreams: Option<Vec<String>>,
     pub threads: Option<usize>,
     pub upstream_timeout_secs: Option<u64>,
+    pub max_cache_entries: Option<usize>,
     pub max_cache_ttl_secs: Option<u32>,
     pub cleanup_interval_secs: Option<u64>,
+    pub max_requests: Option<usize>, // Max requests per window per client
+    pub rate_limit_window_secs: Option<u64>, // window for max requests
 }
 
 impl Config {
@@ -28,6 +31,7 @@ impl Config {
         env::var(key).ok()?.parse::<T>().ok()
     }
 
+    /// Returns the bind address for the DNS server.
     pub fn bind_addr(&self) -> String {
         self.bind
             .clone()
@@ -52,6 +56,7 @@ impl Config {
             .unwrap_or_else(|| vec!["8.8.8.8:53".to_string(), "8.8.4.4:53".to_string()])
     }
 
+    /// Returns the number of worker threads to spawn.
     pub fn threads(&self) -> usize {
         let configured = self
             .threads
@@ -62,6 +67,7 @@ impl Config {
         if configured == 0 { 1 } else { configured }
     }
 
+    /// Returns the timeout duration for upstream DNS queries.
     pub fn upstream_timeout(&self) -> Duration {
         let secs = self
             .upstream_timeout_secs
@@ -71,17 +77,57 @@ impl Config {
         Duration::from_secs(secs)
     }
 
+    /// Returns the maximum number of entries allowed in the DNS cache.
+    pub fn max_cache_entries(&self) -> usize {
+        let configured = self
+            .max_cache_entries
+            .or_else(|| Self::env_parse("DNS_MAX_CACHE_ENTRIES"))
+            .unwrap_or(100_000); // default
+
+        // Safety limits to prevent OOM
+        let min = 1;
+        let max = 1_000_000;
+
+        configured.clamp(min, max)
+    }
+
+    /// Returns the maximum TTL for cached DNS records in seconds.
     pub fn max_cache_ttl(&self) -> u32 {
         self.max_cache_ttl_secs
             .or_else(|| Self::env_parse("DNS_MAX_CACHE_TTL"))
             .unwrap_or(86400)
     }
 
+    /// Returns the interval between cache cleanup runs.
     pub fn cleanup_interval(&self) -> Duration {
         let secs = self
             .cleanup_interval_secs
             .or_else(|| Self::env_parse("DNS_CLEANUP_INTERVAL"))
             .unwrap_or(30); // default 30 seconds
+
+        Duration::from_secs(secs)
+    }
+
+    /// Returns the maximum number of requests per second allowed per client.
+    pub fn max_requests(&self) -> usize {
+        let configured = self
+            .max_requests
+            .or_else(|| Self::env_parse("DNS_MAX_REQUESTS"))
+            .unwrap_or(200); // default
+
+        // Safety limits to prevent self-DoS
+        let min = 1;
+        let max = 50_000;
+
+        configured.clamp(min, max)
+    }
+
+    /// Returns the duration of the rate limit window for client requests.
+    pub fn rate_limit_window(&self) -> Duration {
+        let secs = self
+            .rate_limit_window_secs
+            .or_else(|| Self::env_parse("DNS_RATE_LIMIT_WINDOW"))
+            .unwrap_or(1);
 
         Duration::from_secs(secs)
     }

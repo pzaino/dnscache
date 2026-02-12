@@ -23,7 +23,7 @@ fn main() -> std::io::Result<()> {
     let tcp_listener = TcpListener::bind(config.bind_addr())?;
 
     let server = Arc::new(
-        DnsCacheServer::new(config.upstreams())
+        DnsCacheServer::new(&config)
             .with_timeouts(config.upstream_timeout(), config.max_cache_ttl()),
     );
 

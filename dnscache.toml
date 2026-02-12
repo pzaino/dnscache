@@ -4,3 +4,5 @@ threads = 20
 upstream_timeout_secs = 2
 max_cache_ttl_secs = 3600
 cleanup_interval_secs = 120
+max_requests = 1000
+rate_limit_window_secs = 1

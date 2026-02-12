@@ -10,6 +10,9 @@ use std::time::{Duration, Instant};
 use std::collections::VecDeque;
 use std::sync::atomic::AtomicBool;
 
+use std::net::IpAddr;
+
+use crate::config::Config;
 use crate::dns;
 
 pub const MAX_PACKET_SIZE: usize = 4096;
@@ -17,10 +20,24 @@ pub const DEFAULT_TTL_SECS: u32 = 300;
 pub const MAX_CACHE_TTL_SECS: u32 = 86400;
 
 #[derive(Clone)]
+struct TokenBucket {
+    tokens: f64,
+    last_refill: Instant,
+}
+
+#[derive(Clone)]
+struct RateLimiter {
+    buckets: DashMap<IpAddr, TokenBucket>,
+    capacity: f64,
+    refill_rate: f64, // tokens per second
+}
+
+#[derive(Clone)]
 struct CacheEntry {
     response: Vec<u8>,
     stored_at: Instant,
     original_ttl: u32,
+    expires_at: Instant,
 }
 
 struct InFlight {
@@ -42,25 +59,36 @@ pub struct DnsCacheServer {
     pub cache_hits: AtomicU64,
     pub cache_misses: AtomicU64,
     pub upstream_queries: AtomicU64,
+
+    rate_limiter: RateLimiter,
 }
 
 impl DnsCacheServer {
     /// Create a new server instance with the given upstream. In production, this is called once at startup.
-    pub fn new(upstreams: Vec<String>) -> Self {
+    pub fn new(cfg: &Config) -> Self {
+        let max = cfg.max_requests() as f64;
+        let window_secs = cfg.rate_limit_window().as_secs_f64();
+
         Self {
             cache: DashMap::new(),
             inflight: DashMap::new(),
-            upstreams,
-            upstream_timeout: Duration::from_secs(3),
-            max_cache_ttl: MAX_CACHE_TTL_SECS,
+            upstreams: cfg.upstreams(),
+            upstream_timeout: cfg.upstream_timeout(),
+            max_cache_ttl: cfg.max_cache_ttl(),
 
-            max_cache_entries: 100_000,
+            max_cache_entries: cfg.max_cache_entries(),
             evict_queue: Mutex::new(VecDeque::new()),
             shutdown: AtomicBool::new(false),
 
             cache_hits: AtomicU64::new(0),
             cache_misses: AtomicU64::new(0),
             upstream_queries: AtomicU64::new(0),
+
+            rate_limiter: RateLimiter {
+                buckets: DashMap::new(),
+                capacity: max,
+                refill_rate: max / window_secs,
+            },
         }
     }
 
@@ -68,6 +96,8 @@ impl DnsCacheServer {
     pub fn start_cleanup_task(self: &Arc<Self>, interval: Duration) {
         let cache = self.cache.clone();
         let srv = self.clone();
+
+        let buckets = self.rate_limiter.buckets.clone();
 
         thread::spawn(move || {
             loop {
@@ -80,18 +110,20 @@ impl DnsCacheServer {
                 }
 
                 let now = Instant::now();
+
+                let ttl = Duration::from_secs(300);
+
+                buckets.retain(|_, bucket| now.duration_since(bucket.last_refill) < ttl);
+
                 let mut removed = 0usize;
 
-                let mut to_remove = Vec::new();
+                let keys_to_remove: Vec<Vec<u8>> = cache
+                    .iter()
+                    .filter(|entry| entry.expires_at <= now)
+                    .map(|entry| entry.key().clone())
+                    .collect();
 
-                for entry in cache.iter() {
-                    let elapsed = now.duration_since(entry.stored_at).as_secs();
-                    if elapsed >= entry.original_ttl as u64 {
-                        to_remove.push(entry.key().clone());
-                    }
-                }
-
-                for key in to_remove {
+                for key in keys_to_remove {
                     cache.remove(&key);
                     removed += 1;
                 }
@@ -249,10 +281,12 @@ impl DnsCacheServer {
 
             // Do not cache zero-TTL responses
             if ttl > 0 {
+                let now = Instant::now();
                 self.cache.insert(key.clone(), CacheEntry {
                     response: response.clone(),
-                    stored_at: Instant::now(),
+                    stored_at: now,
                     original_ttl: ttl,
+                    expires_at: now + Duration::from_secs(ttl as u64),
                 });
                 self.record_and_evict_if_needed(&key);
             }
@@ -285,7 +319,14 @@ impl DnsCacheServer {
 
         if let Some(entry) = self.cache.get(&key) {
             let mut resp = entry.response.clone();
+
+            let now = Instant::now();
+            let elapsed = now.duration_since(entry.stored_at).as_secs();
+            let remaining = entry.original_ttl.saturating_sub(elapsed as u32);
+
+            dns::rewrite_ttl(&mut resp, remaining);
             dns::set_txid(&mut resp, txid);
+
             return Some(resp);
         }
 
@@ -297,6 +338,10 @@ impl DnsCacheServer {
 
     /// Handles all UDP requests. In production, this is called from the main loop for each received packet.
     pub fn handle_udp_request(&self, listen_socket: &UdpSocket, request: &[u8], src: SocketAddr) {
+        if !self.allow_request(src) {
+            return; // silently drop
+        }
+
         if let Some(response) = self.process_dns_query(request) {
             let _ = listen_socket.send_to(&response, src);
         }
@@ -327,6 +372,14 @@ impl DnsCacheServer {
                 break;
             }
 
+            if !self.allow_request(
+                stream
+                    .peer_addr()
+                    .unwrap_or_else(|_| "0.0.0.0:0".parse().unwrap()),
+            ) {
+                break;
+            }
+
             if let Some(response) = self.process_dns_query(&buffer) {
                 let resp_len = (response.len() as u16).to_be_bytes();
 
@@ -338,6 +391,38 @@ impl DnsCacheServer {
                     break;
                 }
             }
+        }
+    }
+
+    /// Simple rate limiter that allows up to `max_requests` per `window` duration for each client IP. This is called at the start of request processing, and if it returns false, the request should be dropped immediately without processing.
+    fn allow_request(&self, addr: SocketAddr) -> bool {
+        let ip = addr.ip();
+        let now = Instant::now();
+
+        let mut entry = self
+            .rate_limiter
+            .buckets
+            .entry(ip)
+            .or_insert_with(|| TokenBucket {
+                tokens: self.rate_limiter.capacity,
+                last_refill: now,
+            });
+
+        let elapsed = now
+            .checked_duration_since(entry.last_refill)
+            .map(|d| d.as_secs_f64())
+            .unwrap_or(0.0);
+
+        // Refill tokens
+        let new_tokens = elapsed * self.rate_limiter.refill_rate;
+        entry.tokens = (entry.tokens + new_tokens).min(self.rate_limiter.capacity);
+        entry.last_refill = now;
+
+        if entry.tokens >= 1.0 {
+            entry.tokens -= 1.0;
+            true
+        } else {
+            false
         }
     }
 
@@ -585,6 +670,76 @@ impl DnsCacheServer {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 "Upstream question section mismatch",
+            ));
+        }
+
+        self.validate_dns_sections(response)?;
+        Ok(())
+    }
+
+    fn validate_dns_sections(&self, packet: &[u8]) -> std::io::Result<()> {
+        if packet.len() < dns::DNS_HEADER_LEN {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "Packet too short",
+            ));
+        }
+
+        let qdcount = u16::from_be_bytes([packet[4], packet[5]]);
+        let ancount = u16::from_be_bytes([packet[6], packet[7]]);
+        let nscount = u16::from_be_bytes([packet[8], packet[9]]);
+        let arcount = u16::from_be_bytes([packet[10], packet[11]]);
+
+        let mut offset = dns::DNS_HEADER_LEN;
+
+        // ---- Walk Question Section ----
+        for _ in 0..qdcount {
+            offset = dns::skip_name(packet, offset).ok_or_else(|| {
+                std::io::Error::new(std::io::ErrorKind::InvalidData, "Invalid question name")
+            })?;
+
+            if offset + 4 > packet.len() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "Question truncated",
+                ));
+            }
+
+            offset += 4; // QTYPE + QCLASS
+        }
+
+        // ---- Walk Resource Records ----
+        let total_rr = ancount as usize + nscount as usize + arcount as usize;
+
+        for _ in 0..total_rr {
+            offset = dns::skip_name(packet, offset).ok_or_else(|| {
+                std::io::Error::new(std::io::ErrorKind::InvalidData, "Invalid RR name")
+            })?;
+
+            if offset + 10 > packet.len() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "RR header truncated",
+                ));
+            }
+
+            let rdlength = u16::from_be_bytes([packet[offset + 8], packet[offset + 9]]) as usize;
+            offset += 10;
+
+            if offset + rdlength > packet.len() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "RR data truncated",
+                ));
+            }
+
+            offset += rdlength;
+        }
+
+        if offset != packet.len() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "Extra trailing bytes in DNS packet",
             ));
         }
 

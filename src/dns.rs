@@ -223,6 +223,7 @@ pub fn rewrite_ttl(response: &mut [u8], new_ttl: u32) {
     }
 }
 
+/// Finds the end offset of the question section in a DNS packet.
 pub fn find_question_end(packet: &[u8]) -> Option<usize> {
     if packet.len() < DNS_HEADER_LEN {
         return None;
@@ -256,4 +257,290 @@ pub fn find_question_end(packet: &[u8]) -> Option<usize> {
     }
 
     Some(pos + 4)
+}
+
+/// Skips a DNS name (labels + compression).
+/// Returns the offset immediately after the name.
+///
+/// This does NOT expand the name. It only walks it safely.
+///
+/// RFC 1035 compression supported.
+/// Safe against pointer loops and out-of-bounds.
+pub fn skip_name(packet: &[u8], mut offset: usize) -> Option<usize> {
+    if offset >= packet.len() {
+        return None;
+    }
+
+    let mut jumped = false;
+    let mut jump_limit = 0;
+    let mut original_offset = offset;
+
+    loop {
+        if offset >= packet.len() {
+            return None;
+        }
+
+        let len = packet[offset];
+
+        // Compression pointer: 11xxxxxx xxxxxxxx
+        if (len & 0xC0) == 0xC0 {
+            if offset + 1 >= packet.len() {
+                return None;
+            }
+
+            let pointer = (((len & 0x3F) as usize) << 8) | packet[offset + 1] as usize;
+
+            if pointer >= packet.len() {
+                return None;
+            }
+
+            if jump_limit > 10 {
+                // Prevent pointer loop abuse
+                return None;
+            }
+
+            jump_limit += 1;
+
+            offset = pointer;
+            jumped = true;
+            continue;
+        }
+
+        // End of name
+        if len == 0 {
+            if jumped {
+                return Some(original_offset + 2);
+            } else {
+                return Some(offset + 1);
+            }
+        }
+
+        // Normal label
+        let label_len = len as usize;
+
+        // Label length must be <= 63
+        if label_len > 63 {
+            return None;
+        }
+
+        offset += 1;
+
+        if offset + label_len > packet.len() {
+            return None;
+        }
+
+        offset += label_len;
+
+        if !jumped {
+            original_offset = offset;
+        }
+    }
+}
+
+// ---- Unit Tests ----
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // -------------------------
+    // Helpers
+    // -------------------------
+
+    fn build_basic_query() -> Vec<u8> {
+        let mut p = vec![
+            0x12, 0x34, // TXID
+            0x01, 0x00, // flags
+            0x00, 0x01, // QDCOUNT
+            0x00, 0x00, // ANCOUNT
+            0x00, 0x00, // NSCOUNT
+            0x00, 0x00, // ARCOUNT
+        ];
+
+        // example.com
+        p.extend([
+            7, b'e', b'x', b'a', b'm', b'p', b'l', b'e', 3, b'c', b'o', b'm', 0,
+        ]);
+
+        // QTYPE A, QCLASS IN
+        p.extend([0x00, 0x01, 0x00, 0x01]);
+
+        p
+    }
+
+    fn build_basic_response(ttl: u32) -> Vec<u8> {
+        let mut q = build_basic_query();
+        q[2] = 0x81;
+        q[3] = 0x80;
+        q[6] = 0x00;
+        q[7] = 0x01; // ANCOUNT = 1
+
+        // Answer
+        q.extend([0xC0, 0x0C]); // pointer to question
+        q.extend([0x00, 0x01, 0x00, 0x01]); // TYPE A, CLASS IN
+        q.extend_from_slice(&ttl.to_be_bytes());
+        q.extend([0x00, 0x04, 1, 2, 3, 4]);
+
+        q
+    }
+
+    // -------------------------
+    // set_txid
+    // -------------------------
+
+    #[test]
+    fn test_set_txid() {
+        let mut packet = vec![0, 0, 1, 2, 3];
+        set_txid(&mut packet, [0xAA, 0xBB]);
+        assert_eq!(packet[0], 0xAA);
+        assert_eq!(packet[1], 0xBB);
+    }
+
+    // -------------------------
+    // cache_key_from_request
+    // -------------------------
+
+    #[test]
+    fn test_cache_key_from_request() {
+        let q = build_basic_query();
+        let key = cache_key_from_request(&q).unwrap();
+        assert_eq!(key, q[DNS_HEADER_LEN..]);
+    }
+
+    #[test]
+    fn test_cache_key_too_short() {
+        assert!(cache_key_from_request(&[1, 2, 3]).is_none());
+    }
+
+    // -------------------------
+    // extract_min_ttl
+    // -------------------------
+
+    #[test]
+    fn test_extract_min_ttl_single_answer() {
+        let resp = build_basic_response(123);
+        assert_eq!(extract_min_ttl(&resp), Some(123));
+    }
+
+    #[test]
+    fn test_extract_min_ttl_multiple_answers() {
+        let mut resp = build_basic_response(300);
+
+        // second answer with lower TTL
+        resp.extend([0xC0, 0x0C]);
+        resp.extend([0x00, 0x01, 0x00, 0x01]);
+        resp.extend_from_slice(&50u32.to_be_bytes());
+        resp.extend([0x00, 0x04, 5, 6, 7, 8]);
+
+        resp[7] = 0x02; // ANCOUNT = 2
+
+        assert_eq!(extract_min_ttl(&resp), Some(50));
+    }
+
+    // -------------------------
+    // rewrite_ttl
+    // -------------------------
+
+    #[test]
+    fn test_rewrite_ttl() {
+        let mut resp = build_basic_response(100);
+        rewrite_ttl(&mut resp, 999);
+
+        assert_eq!(extract_min_ttl(&resp), Some(999));
+    }
+
+    // -------------------------
+    // find_question_end
+    // -------------------------
+
+    #[test]
+    fn test_find_question_end() {
+        let q = build_basic_query();
+        let end = find_question_end(&q).unwrap();
+        assert_eq!(end, q.len());
+    }
+
+    #[test]
+    fn test_find_question_end_malformed() {
+        let mut q = build_basic_query();
+        q.pop(); // truncate
+        assert!(find_question_end(&q).is_none());
+    }
+
+    // -------------------------
+    // skip_name
+    // -------------------------
+
+    #[test]
+    fn test_skip_name_plain() {
+        let q = build_basic_query();
+        let offset = DNS_HEADER_LEN;
+        let end = skip_name(&q, offset).unwrap();
+
+        // Should land on QTYPE
+        assert_eq!(end, q.len() - 4);
+    }
+
+    #[test]
+    fn test_skip_name_pointer() {
+        let resp = build_basic_response(60);
+
+        // answer name starts after question
+        let q_end = find_question_end(&resp).unwrap();
+        let name_offset = q_end;
+
+        let end = skip_name(&resp, name_offset).unwrap();
+        assert_eq!(end, name_offset + 2);
+    }
+
+    #[test]
+    fn test_skip_name_invalid_label_length() {
+        let mut packet = build_basic_query();
+        packet[DNS_HEADER_LEN] = 70; // invalid label >63
+        assert!(skip_name(&packet, DNS_HEADER_LEN).is_none());
+    }
+
+    #[test]
+    fn test_skip_name_pointer_loop_protection() {
+        let mut packet = vec![0u8; 20];
+        packet[0] = 0xC0;
+        packet[1] = 0x00; // pointer to itself
+
+        assert!(skip_name(&packet, 0).is_none());
+    }
+
+    // -------------------------
+    // extract_negative_ttl
+    // -------------------------
+
+    #[test]
+    fn test_extract_negative_ttl_soa() {
+        let mut packet = build_basic_query();
+
+        packet[8] = 0x00;
+        packet[9] = 0x01; // NSCOUNT = 1
+
+        // SOA record
+        packet.extend([0xC0, 0x0C]); // NAME
+        packet.extend([0x00, 0x06]); // TYPE = SOA
+        packet.extend([0x00, 0x01]); // CLASS IN
+        packet.extend_from_slice(&300u32.to_be_bytes());
+        packet.extend([0x00, 0x16]); // RDLEN 22
+
+        // MNAME
+        packet.extend([0]);
+        // RNAME
+        packet.extend([0]);
+
+        // SERIAL, REFRESH, RETRY, EXPIRE
+        packet.extend([0, 0, 0, 1]);
+        packet.extend([0, 0, 0, 2]);
+        packet.extend([0, 0, 0, 3]);
+        packet.extend([0, 0, 0, 4]);
+
+        // MINIMUM
+        packet.extend([0, 0, 0, 10]);
+
+        assert_eq!(extract_negative_ttl(&packet), Some(10));
+    }
 }
