@@ -10,6 +10,10 @@ This tool is a simple DNS Cache system that can be used when you have a lot of D
 - Uses a HashMap to store the cached results with expiration times.
 - Provides Cache auto clean up to remove expired entries.
 - Provides stats to check the number of cached entries and cache hit/miss ratio.
+- Provides rate-limiter to prevent abuse and protect the upstream DNS server.
+- Supports multiple threads to handle concurrent DNS queries efficiently.
+- Provides a configuration file to customize the cache behavior and parameters.
+- Implements quite a few DNS verification checks to ensure the integrity of the cached data and prevent poisoning attacks.
 
 ## Usage
 
