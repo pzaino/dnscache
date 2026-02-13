@@ -17,13 +17,13 @@ This will execute the tests defined in the `integration_tests.rs` file. Make sur
 To run the performance tests, you can use the following command:
 
 ```bash
-./tests/system_tests.sh
+./tests/system_test.sh
 ```
 
 or
 
 ```bash
-dnsperf -s 127.0.0.1 -p 6363 -d ./tests/queries.txt -l 30 -Q 20000
+dnsperf -s 127.0.0.1 -p 53 -d ./tests/queries.txt -l 30 -Q 20000
 ```
 
 This will execute the performance tests defined in the `system_tests.sh` script or using the `dnsperf` tool. Make sure you have the necessary environment set up for the tests to run successfully.
