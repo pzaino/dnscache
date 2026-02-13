@@ -1,12 +1,18 @@
 # DNSCache
 
+<img align="right" src="images/logo.svg" alt="dnscache logo" width="140"/>
+
 Simple and High-Performance DNS Caching resolver
 
-<p align="right">
-  <img src="images/logo.svg" alt="dnscache logo" width="140"/>
-</p>
-
 This tool is a simple DNS Cache system that can be used when you have a lot of DNS queries and want to reduce the latency by caching the results. It is implemented in Rust for performance and safety.
+
+I am also developing it to be safe and robust against DNS poisoning attacks, so it includes several verification checks to ensure the integrity of the cached data.
+
+## CI Status
+
+[![Build](https://github.com/pzaino/dnscache/actions/workflows/000_ci.yml/badge.svg)](https://github.com/pzaino/dnscache/actions/workflows/000_ci.yml)
+[![Tests](https://github.com/pzaino/dnscache/actions/workflows/scorecards.yml/badge.svg)](https://github.com/pzaino/dnscache/actions/workflows/scorecards.yml)
+[![OSV Scan](https://github.com/pzaino/dnscache/actions/workflows/osv-scanner.yml/badge.svg)](https://github.com/pzaino/dnscache/actions/workflows/osv-scanner.yml)
 
 ## Features
 
