@@ -17,6 +17,10 @@ MAX_REQUESTS="10000"
 RATE_WINDOW="1"
 MAX_CACHE_TTL="3600"
 MAX_CACHE_ENTRIES="200000"
+DNS_BIND="172.0.0.1:53"
+CLEANUP_INTERVAL=30
+MAX_REQUESTS=20000
+RATE_WINDOW=1
 
 FORCE="false"
 DRY_RUN="false"
@@ -78,6 +82,10 @@ while true; do
       UPSTREAMS="$2"
       shift 2
       ;;
+    --bind)
+      DNS_BIND="$2"
+      shift 2
+      ;;
     --max-requests)
       MAX_REQUESTS="$2"
       shift 2
@@ -92,6 +100,10 @@ while true; do
       ;;
     --max-cache-entries)
       MAX_CACHE_ENTRIES="$2"
+      shift 2
+      ;;
+    --cleanup-interval)
+      CLEANUP_INTERVAL="$2"
       shift 2
       ;;
     --force)
@@ -117,11 +129,13 @@ done
 # -----------------------------
 
 validate_upstreams "$UPSTREAMS"
+validate_upstreams "$DNS_BIND"
 
 is_positive_integer "$MAX_REQUESTS" || error "MAX_REQUESTS must be a positive integer"
 is_positive_integer "$RATE_WINDOW" || error "RATE_WINDOW must be a positive integer"
 is_positive_integer "$MAX_CACHE_TTL" || error "MAX_CACHE_TTL must be a positive integer"
 is_positive_integer "$MAX_CACHE_ENTRIES" || error "MAX_CACHE_ENTRIES must be a positive integer"
+is_positive_integer "$CLEANUP_INTERVAL" || error "CLEANUP_INTERVAL must be a positive integer"
 
 # -----------------------------
 # Root check
@@ -132,11 +146,13 @@ if [[ "$DRY_RUN" != "true" ]] && [[ $EUID -ne 0 ]]; then
 fi
 
 info "Installing dnscache with configuration:"
+echo "  DNS_BIND=$DNS_BIND"
 echo "  UPSTREAMS=$UPSTREAMS"
-echo "  MAX_REQUESTS=$MAX_REQUESTS"
-echo "  RATE_WINDOW=$RATE_WINDOW"
 echo "  MAX_CACHE_TTL=$MAX_CACHE_TTL"
 echo "  MAX_CACHE_ENTRIES=$MAX_CACHE_ENTRIES"
+echo "  CLEANUP_INTERVAL=$CLEANUP_INTERVAL"
+echo "  MAX_REQUESTS=$MAX_REQUESTS"
+echo "  RATE_WINDOW=$RATE_WINDOW"
 echo "  FORCE=$FORCE"
 echo "  DRY_RUN=$DRY_RUN"
 
@@ -179,11 +195,13 @@ else
 
   if [[ "$DRY_RUN" == "true" ]]; then
     cat <<EOF
-DNSCACHE_UPSTREAMS=$UPSTREAMS
-DNSCACHE_MAX_REQUESTS=$MAX_REQUESTS
-DNSCACHE_RATE_LIMIT_WINDOW_SECS=$RATE_WINDOW
-DNSCACHE_MAX_CACHE_TTL_SECS=$MAX_CACHE_TTL
-DNSCACHE_MAX_CACHE_ENTRIES=$MAX_CACHE_ENTRIES
+DNS_BIND=$DNS_BIND
+DNS_UPSTREAMS=$UPSTREAMS
+DNS_MAX_CACHE_TTL_SECS=$MAX_CACHE_TTL
+DNS_MAX_CACHE_ENTRIES=$MAX_CACHE_ENTRIES
+DNS_CLEANUP_INTERVAL=$CLEANUP_INTERVAL
+DNS_MAX_REQUESTS=$MAX_REQUESTS
+DNS_RATE_LIMIT_WINDOW=$RATE_WINDOW
 EOF
   else
     cat <<EOF > "$ENV_FILE"
