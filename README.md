@@ -1,4 +1,10 @@
-# Simple and High-Performance DNS Caching resolver
+# DNSCache
+
+Simple and High-Performance DNS Caching resolver
+
+<p align="right">
+  <img src="images/logo.svg" alt="dnscache logo" width="140"/>
+</p>
 
 This tool is a simple DNS Cache system that can be used when you have a lot of DNS queries and want to reduce the latency by caching the results. It is implemented in Rust for performance and safety.
 

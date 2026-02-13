@@ -1,0 +1,26 @@
+<svg width="180" height="200" viewBox="0 0 180 200" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="dnscache shield logo">
+  <title>dnscache</title>
+
+  <!-- Shield -->
+  <path d="M90 10 L160 40 L160 100 C160 145 125 175 90 190 C55 175 20 145 20 100 L20 40 Z"
+        fill="#0f172a"
+        stroke="#334155"
+        stroke-width="3"/>
+
+  <!-- Flow lines -->
+  <g stroke="#64748b" stroke-width="2" stroke-linecap="round">
+    <line x1="90" y1="55" x2="90" y2="100"/>
+    <line x1="90" y1="100" x2="55" y2="135"/>
+    <line x1="90" y1="100" x2="125" y2="135"/>
+  </g>
+
+  <!-- Upstream DNS node -->
+  <circle cx="90" cy="45" r="10" fill="#60a5fa"/>
+
+  <!-- dnscache core -->
+  <circle cx="90" cy="100" r="12" fill="#2EC4B6"/>
+
+  <!-- Clients -->
+  <circle cx="55" cy="145" r="9" fill="#94a3b8"/>
+  <circle cx="125" cy="145" r="9" fill="#94a3b8"/>
+</svg>
