@@ -701,7 +701,7 @@ impl DnsCacheServer {
     }
 
     #[cfg(test)]
-    pub fn validate_dns_sections_for_test(&self, packet: &[u8]) -> std::io::Result<()> {
+    pub(crate) fn validate_dns_sections_for_test(&self, packet: &[u8]) -> std::io::Result<()> {
         self.validate_dns_sections(packet)
     }
 
