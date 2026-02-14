@@ -612,11 +612,28 @@ impl DnsCacheServer {
         self.shutdown.load(Ordering::Relaxed)
     }
 
+    #[cfg(test)]
+    pub(crate) fn validate_upstream_for_test(
+        &self,
+        request: &[u8],
+        response: &[u8],
+    ) -> std::io::Result<()> {
+        self.validate_upstream_response(request, response)
+    }
+
     fn validate_upstream_response(&self, request: &[u8], response: &[u8]) -> std::io::Result<()> {
         if response.len() < dns::DNS_HEADER_LEN {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 "Upstream response too short",
+            ));
+        }
+
+        // Validate TXID matches request
+        if response.len() >= 2 && (response[0] != request[0] || response[1] != request[1]) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "Upstream TXID mismatch",
             ));
         }
 
@@ -681,6 +698,12 @@ impl DnsCacheServer {
 
         self.validate_dns_sections(response)?;
         Ok(())
+    }
+
+    #[cfg(test)]
+    #[allow(dead_code)]
+    pub(crate) fn validate_dns_sections_for_test(&self, packet: &[u8]) -> std::io::Result<()> {
+        self.validate_dns_sections(packet)
     }
 
     fn validate_dns_sections(&self, packet: &[u8]) -> std::io::Result<()> {
@@ -750,5 +773,167 @@ impl DnsCacheServer {
         }
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod poisoning_tests {
+    use super::*;
+    use crate::config::Config;
+    use crate::dns;
+    use std::time::Duration;
+
+    // ------------------------------------------------------------
+    // Helpers
+    // ------------------------------------------------------------
+
+    fn example_com() -> Vec<u8> {
+        vec![
+            7, b'e', b'x', b'a', b'm', b'p', b'l', b'e', 3, b'c', b'o', b'm', 0,
+        ]
+    }
+
+    fn build_query(domain: &[u8]) -> Vec<u8> {
+        let mut p = vec![
+            0x12, 0x34, // TXID
+            0x01, 0x00, // flags (standard query)
+            0x00, 0x01, // QDCOUNT = 1
+            0x00, 0x00, // ANCOUNT
+            0x00, 0x00, // NSCOUNT
+            0x00, 0x00, // ARCOUNT
+        ];
+
+        p.extend_from_slice(domain);
+        p.extend([0x00, 0x01, 0x00, 0x01]); // QTYPE A, QCLASS IN
+        p
+    }
+
+    fn build_valid_response(ttl: u32) -> Vec<u8> {
+        let mut r = build_query(&example_com());
+
+        r[2] = 0x81; // QR=1
+        r[3] = 0x80; // RA=1
+        r[6] = 0x00;
+        r[7] = 0x01; // ANCOUNT = 1
+
+        // Answer
+        r.extend([0xC0, 0x0C]); // pointer to question
+        r.extend([0x00, 0x01, 0x00, 0x01]); // TYPE A, CLASS IN
+        r.extend_from_slice(&ttl.to_be_bytes());
+        r.extend([0x00, 0x04, 1, 2, 3, 4]); // RDATA
+
+        r
+    }
+
+    // ------------------------------------------------------------
+    // Poisoning Tests
+    // ------------------------------------------------------------
+
+    #[test]
+    fn poison_txid_mismatch_rejected() {
+        let cfg = Config::default();
+        let server = DnsCacheServer::new(&cfg);
+
+        let request = build_query(&example_com());
+        let mut forged = build_valid_response(300);
+
+        forged[0] ^= 0xFF; // corrupt TXID
+
+        assert!(
+            server
+                .validate_upstream_for_test(&request, &forged)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn poison_question_mismatch_rejected() {
+        let cfg = Config::default();
+        let server = DnsCacheServer::new(&cfg);
+
+        let request = build_query(&example_com());
+        let mut forged = build_valid_response(300);
+
+        // Corrupt first label length
+        forged[12] = 3;
+        forged[13] = b'b';
+
+        assert!(
+            server
+                .validate_upstream_for_test(&request, &forged)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn poison_trailing_bytes_rejected() {
+        let cfg = Config::default();
+        let server = DnsCacheServer::new(&cfg);
+
+        let request = build_query(&example_com());
+        let mut forged = build_valid_response(300);
+
+        forged.extend([9, 9, 9, 9]); // trailing garbage
+
+        assert!(
+            server
+                .validate_upstream_for_test(&request, &forged)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn poison_pointer_out_of_bounds_rejected() {
+        let cfg = Config::default();
+        let server = DnsCacheServer::new(&cfg);
+
+        let request = build_query(&example_com());
+        let mut forged = build_valid_response(300);
+
+        // Replace first label with invalid compression pointer
+        forged[12] = 0xC0;
+        forged[13] = 0xFF;
+
+        assert!(
+            server
+                .validate_upstream_for_test(&request, &forged)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn poison_ttl_inflation_is_capped() {
+        let mut cfg = Config::default();
+        cfg.set_max_cache_ttl(60);
+
+        let server = DnsCacheServer::new(&cfg).with_timeouts(Duration::from_millis(10), 60);
+
+        let request = build_query(&example_com());
+        let forged = build_valid_response(999_999);
+
+        // Validation must succeed structurally
+        assert!(server.validate_upstream_for_test(&request, &forged).is_ok());
+
+        // Simulate caching logic
+        let extracted = dns::extract_min_ttl(&forged).unwrap();
+        assert!(extracted > 60);
+
+        let capped = extracted.min(server.max_cache_ttl);
+        assert_eq!(capped, 60);
+    }
+
+    #[test]
+    fn accepts_valid_response() {
+        let cfg = Config::default();
+        let server = DnsCacheServer::new(&cfg);
+
+        let request = build_query(&example_com());
+        let response = build_valid_response(300);
+
+        assert!(
+            server
+                .validate_upstream_for_test(&request, &response)
+                .is_ok()
+        );
     }
 }

@@ -33,3 +33,17 @@ path = "fuzz_targets/fuzz_cache_key.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "fuzz_process_query"
+path = "fuzz_targets/fuzz_process_query.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_skip_name"
+path = "fuzz_targets/fuzz_skip_name.rs"
+test = false
+doc = false
+bench = false
