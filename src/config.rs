@@ -143,4 +143,8 @@ impl Config {
 
         Duration::from_secs(secs)
     }
+
+    pub fn set_max_cache_ttl(&mut self, ttl: u32) {
+        self.max_cache_ttl_secs = Some(ttl);
+    }
 }
