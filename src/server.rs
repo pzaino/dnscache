@@ -612,6 +612,7 @@ impl DnsCacheServer {
         self.shutdown.load(Ordering::Relaxed)
     }
 
+    #[cfg(test)]
     pub(crate) fn validate_upstream_for_test(
         &self,
         request: &[u8],
