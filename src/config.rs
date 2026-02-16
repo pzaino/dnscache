@@ -1,7 +1,7 @@
 /*
  * DNS Cache Server
  *
- * Copyright (c) 2026 Paolo Fabio Zaino
+ * Copyright (c) 2026 Paolo Fabio Zaino, all rights reserved.
  *
  * This Source Code Form is subject to the terms of the Mozilla Public
  * License, v. 2.0. If a copy of the MPL was not distributed with this
@@ -10,22 +10,33 @@
  * SPDX-License-Identifier: MPL-2.0
  */
 
+// File: src/config.rs
+
 use serde::Deserialize;
 use std::env;
 use std::fs;
 use std::time::Duration;
 
-#[derive(Debug, Deserialize, Default)]
+use crate::dns;
+
+#[derive(Debug, Clone, Deserialize, Default)]
 pub struct Config {
     pub bind: Option<String>,
+
     pub upstreams: Option<Vec<String>>,
-    pub threads: Option<usize>,
     pub upstream_timeout_secs: Option<u64>,
+
+    pub threads: Option<usize>,
     pub max_cache_entries: Option<usize>,
     pub max_cache_ttl_secs: Option<u32>,
     pub cleanup_interval_secs: Option<u64>,
+
     pub max_requests: Option<usize>, // Max requests per window per client
     pub rate_limit_window_secs: Option<u64>, // window for max requests
+
+    pub cache_answer_types: Option<Vec<String>>,
+    pub cache_authority: Option<bool>,
+    pub cache_additional: Option<bool>,
 }
 
 impl Config {
@@ -146,5 +157,28 @@ impl Config {
 
     pub fn set_max_cache_ttl(&mut self, ttl: u32) {
         self.max_cache_ttl_secs = Some(ttl);
+    }
+
+    pub fn cache_answer_types(&self) -> Vec<u16> {
+        let defaults = vec![1, 28, 5]; // A, AAAA, CNAME
+
+        self.cache_answer_types
+            .as_ref()
+            .map(|types| {
+                types
+                    .iter()
+                    .filter_map(|t| dns::rr_type_from_string(t))
+                    .collect()
+            })
+            .filter(|v: &Vec<u16>| !v.is_empty())
+            .unwrap_or(defaults)
+    }
+
+    pub fn cache_authority(&self) -> bool {
+        self.cache_authority.unwrap_or(false)
+    }
+
+    pub fn cache_additional(&self) -> bool {
+        self.cache_additional.unwrap_or(false)
     }
 }

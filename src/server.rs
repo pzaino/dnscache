@@ -10,6 +10,8 @@
  * SPDX-License-Identifier: MPL-2.0
  */
 
+// File: src/server.rs
+
 use dashmap::DashMap;
 use std::io::{Read, Write};
 use std::net::TcpStream;
@@ -27,9 +29,13 @@ use std::net::IpAddr;
 use crate::config::Config;
 use crate::dns;
 
+use rand::RngCore;
+use rand::rngs::OsRng;
+
 pub const MAX_PACKET_SIZE: usize = 4096;
 pub const DEFAULT_TTL_SECS: u32 = 300;
 pub const MAX_CACHE_TTL_SECS: u32 = 86400;
+pub const MAX_RR_PER_PACKET: usize = 128;
 
 #[derive(Clone)]
 struct TokenBucket {
@@ -73,6 +79,13 @@ pub struct DnsCacheServer {
     pub upstream_queries: AtomicU64,
 
     rate_limiter: RateLimiter,
+
+    allowed_cache_types: Vec<u16>,
+    cache_authority: bool,
+    cache_additional: bool,
+
+    #[allow(dead_code)]
+    cfg: Config,
 }
 
 impl DnsCacheServer {
@@ -80,6 +93,9 @@ impl DnsCacheServer {
     pub fn new(cfg: &Config) -> Self {
         let max = cfg.max_requests() as f64;
         let window_secs = cfg.rate_limit_window().as_secs_f64();
+        let cfg_clone = cfg.clone();
+
+        let allowed_cache_types = cfg.cache_answer_types();
 
         Self {
             cache: DashMap::new(),
@@ -101,6 +117,12 @@ impl DnsCacheServer {
                 capacity: max,
                 refill_rate: max / window_secs,
             },
+
+            allowed_cache_types,
+            cache_authority: cfg.cache_authority(),
+            cache_additional: cfg.cache_additional(),
+
+            cfg: cfg_clone,
         }
     }
 
@@ -291,17 +313,38 @@ impl DnsCacheServer {
 
             // Do not cache zero-TTL responses
             if ttl > 0 {
-                let now = Instant::now();
-                self.cache.insert(
-                    key.clone(),
-                    CacheEntry {
-                        response: response.clone(),
-                        stored_at: now,
-                        original_ttl: ttl,
-                        expires_at: now + Duration::from_secs(ttl as u64),
-                    },
-                );
-                self.record_and_evict_if_needed(&key);
+                // Filter what is cacheable according to policy
+                match dns::filter_cacheable_records(
+                    &response,
+                    &self.allowed_cache_types,
+                    self.cache_authority,
+                    self.cache_additional,
+                ) {
+                    Ok(filtered) => {
+                        // Do not cache empty answer packets
+                        let filtered_ancount = u16::from_be_bytes([filtered[6], filtered[7]]);
+
+                        if filtered_ancount > 0 {
+                            let now = Instant::now();
+
+                            self.cache.insert(
+                                key.clone(),
+                                CacheEntry {
+                                    response: filtered,
+                                    stored_at: now,
+                                    original_ttl: ttl,
+                                    expires_at: now + Duration::from_secs(ttl as u64),
+                                },
+                            );
+
+                            self.record_and_evict_if_needed(&key);
+                        }
+                    }
+                    Err(_) => {
+                        // Filtering failed → treat as uncacheable
+                        // Do NOT cache
+                    }
+                }
             }
 
             // Wake followers
@@ -440,9 +483,33 @@ impl DnsCacheServer {
     }
 
     pub fn forward_to_upstream(&self, request: &[u8]) -> std::io::Result<Vec<u8>> {
+        if request.len() < 2 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "Request too short",
+            ));
+        }
+
+        // 1. Save client TXID
+        let client_txid = [request[0], request[1]];
+
+        // 2. Clone request so we can mutate it
+        let mut upstream_request = request.to_vec();
+
+        // 3. Generate strong random TXID
+        let upstream_txid = generate_txid();
+
+        // 4. Replace TXID for upstream query
+        dns::set_txid(&mut upstream_request, upstream_txid);
+
         for upstream in &self.upstreams {
-            if let Ok(resp) = self.forward_single_upstream(request, upstream) {
-                return Ok(resp);
+            match self.forward_single_upstream(&upstream_request, upstream) {
+                Ok(mut resp) => {
+                    // 5. Rewrite TXID back to client's original
+                    dns::set_txid(&mut resp, client_txid);
+                    return Ok(resp);
+                }
+                Err(_) => continue,
             }
         }
 
@@ -465,7 +532,21 @@ impl DnsCacheServer {
             self.upstream_queries.fetch_add(1, Ordering::Relaxed);
 
             let mut buf = [0u8; MAX_PACKET_SIZE];
-            let (size, _) = sock.recv_from(&mut buf)?;
+            let (size, src_addr) = sock.recv_from(&mut buf)?;
+
+            let upstream_socket_addr: SocketAddr = upstream.parse().map_err(|_| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "Invalid upstream socket address",
+                )
+            })?;
+
+            if src_addr != upstream_socket_addr {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "Upstream UDP response from unexpected source",
+                ));
+            }
 
             let response = buf[..size].to_vec();
 
@@ -477,7 +558,7 @@ impl DnsCacheServer {
             }
 
             // Validate TXID matches
-            if response.len() >= 2 && (response[0] != request[0] || response[1] != request[1]) {
+            if response.len() >= 2 && ((response[0] != request[0]) || (response[1] != request[1])) {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
                     "Upstream TXID mismatch",
@@ -740,6 +821,13 @@ impl DnsCacheServer {
         // ---- Walk Resource Records ----
         let total_rr = ancount as usize + nscount as usize + arcount as usize;
 
+        if total_rr > MAX_RR_PER_PACKET {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "Too many resource records",
+            ));
+        }
+
         for _ in 0..total_rr {
             offset = dns::skip_name(packet, offset).ok_or_else(|| {
                 std::io::Error::new(std::io::ErrorKind::InvalidData, "Invalid RR name")
@@ -775,6 +863,16 @@ impl DnsCacheServer {
         Ok(())
     }
 }
+
+fn generate_txid() -> [u8; 2] {
+    let mut bytes = [0u8; 2];
+    OsRng.fill_bytes(&mut bytes);
+    bytes
+}
+
+// ------------------------------------------------------------
+// Poisoning Tests and Unit Tests
+// ------------------------------------------------------------
 
 #[cfg(test)]
 mod poisoning_tests {

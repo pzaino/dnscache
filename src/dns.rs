@@ -10,6 +10,10 @@
  * SPDX-License-Identifier: MPL-2.0
  */
 
+// File: src/dns.rs
+
+use std::io;
+
 pub const DNS_HEADER_LEN: usize = 12;
 
 /// Replace transaction ID in a DNS response buffer.
@@ -555,4 +559,243 @@ mod tests {
 
         assert_eq!(extract_negative_ttl(&packet), Some(10));
     }
+}
+
+pub fn rr_type_from_string(s: &str) -> Option<u16> {
+    match s.trim().to_uppercase().as_str() {
+        "A" => Some(1),
+        "NS" => Some(2),
+        "CNAME" => Some(5),
+        "SOA" => Some(6),
+        "PTR" => Some(12),
+        "MX" => Some(15),
+        "TXT" => Some(16),
+        "AAAA" => Some(28),
+        _ => None,
+    }
+}
+
+/// Filters a DNS response packet to only include cacheable records of allowed types.
+pub fn filter_cacheable_records(
+    packet: &[u8],
+    allowed_types: &[u16],
+    cache_authority: bool,
+    cache_additional: bool,
+) -> io::Result<Vec<u8>> {
+    if packet.len() < DNS_HEADER_LEN {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Packet too short",
+        ));
+    }
+
+    // ---- Parse header counts ----
+    let qdcount = u16::from_be_bytes([packet[4], packet[5]]);
+    let ancount = u16::from_be_bytes([packet[6], packet[7]]);
+    let nscount = u16::from_be_bytes([packet[8], packet[9]]);
+    let arcount = u16::from_be_bytes([packet[10], packet[11]]);
+
+    let mut offset = DNS_HEADER_LEN;
+
+    // ---- Copy question section ----
+    for _ in 0..qdcount {
+        offset = skip_name(packet, offset)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "Invalid question name"))?;
+
+        if offset + 4 > packet.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Question truncated",
+            ));
+        }
+
+        offset += 4;
+    }
+
+    let question_end = offset;
+    //let qname_end = question_end - 4;
+    let qname_expanded = normalize_name(
+        &expand_name(packet, DNS_HEADER_LEN)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "Invalid QNAME"))?,
+    );
+
+    // ---- Filter sections ----
+    let mut new_answers: Vec<Vec<u8>> = Vec::new();
+    let mut new_authority: Vec<Vec<u8>> = Vec::new();
+    let mut new_additional: Vec<Vec<u8>> = Vec::new();
+
+    // ---- Answers ----
+    for _ in 0..ancount {
+        let rr_start = offset;
+
+        let rr_name_expanded = normalize_name(
+            &expand_name(packet, rr_start)
+                .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "Invalid RR name"))?,
+        );
+
+        let (rr_end, rr_slice, rr_type) = parse_rr(packet, rr_start)?;
+
+        if allowed_types.contains(&rr_type) && rr_name_expanded == qname_expanded {
+            new_answers.push(rr_slice);
+        }
+
+        offset = rr_end;
+    }
+
+    // ---- Authority ----
+    for _ in 0..nscount {
+        let (rr_end, rr_slice, rr_type) = parse_rr(packet, offset)?;
+        if cache_authority && allowed_types.contains(&rr_type) {
+            new_authority.push(rr_slice);
+        }
+        offset = rr_end;
+    }
+
+    // ---- Additional ----
+    for _ in 0..arcount {
+        let (rr_end, rr_slice, rr_type) = parse_rr(packet, offset)?;
+        if cache_additional && allowed_types.contains(&rr_type) {
+            new_additional.push(rr_slice);
+        }
+        offset = rr_end;
+    }
+
+    // ---- Rebuild packet ----
+    let mut new_packet = Vec::with_capacity(packet.len());
+
+    // Copy original header first
+    new_packet.extend_from_slice(&packet[..DNS_HEADER_LEN]);
+
+    // Copy question section
+    new_packet.extend_from_slice(&packet[DNS_HEADER_LEN..question_end]);
+
+    // Append filtered sections
+    for rr in &new_answers {
+        new_packet.extend_from_slice(rr);
+    }
+    for rr in &new_authority {
+        new_packet.extend_from_slice(rr);
+    }
+    for rr in &new_additional {
+        new_packet.extend_from_slice(rr);
+    }
+
+    // ---- Fix section counts ----
+    let an = (new_answers.len() as u16).to_be_bytes();
+    let ns = (new_authority.len() as u16).to_be_bytes();
+    let ar = (new_additional.len() as u16).to_be_bytes();
+
+    new_packet[6] = an[0];
+    new_packet[7] = an[1];
+    new_packet[8] = ns[0];
+    new_packet[9] = ns[1];
+    new_packet[10] = ar[0];
+    new_packet[11] = ar[1];
+
+    Ok(new_packet)
+}
+
+pub fn expand_name(packet: &[u8], mut offset: usize) -> Option<Vec<u8>> {
+    let mut result = Vec::new();
+    let mut jump_limit = 0;
+    let mut visited_offsets = 0;
+
+    loop {
+        if offset >= packet.len() {
+            return None;
+        }
+
+        let len = packet[offset];
+
+        // Compression pointer
+        if (len & 0xC0) == 0xC0 {
+            if offset + 1 >= packet.len() {
+                return None;
+            }
+
+            let pointer = (((len & 0x3F) as usize) << 8) | packet[offset + 1] as usize;
+
+            if pointer >= packet.len() {
+                return None;
+            }
+
+            if jump_limit > 10 {
+                return None; // pointer loop protection
+            }
+
+            jump_limit += 1;
+            offset = pointer;
+            continue;
+        }
+
+        // End of name
+        if len == 0 {
+            result.push(0);
+            break;
+        }
+
+        if len > 63 {
+            return None;
+        }
+
+        offset += 1;
+
+        if offset + len as usize > packet.len() {
+            return None;
+        }
+
+        result.push(len);
+        result.extend_from_slice(&packet[offset..offset + len as usize]);
+
+        offset += len as usize;
+
+        visited_offsets += 1;
+        if visited_offsets > 255 {
+            return None; // sanity limit
+        }
+    }
+
+    Some(result)
+}
+
+/// Normalizes a DNS name by converting ASCII letters to lowercase.
+fn normalize_name(name: &[u8]) -> Vec<u8> {
+    name.iter()
+        .map(|b| {
+            if b.is_ascii_uppercase() {
+                b.to_ascii_lowercase()
+            } else {
+                *b
+            }
+        })
+        .collect()
+}
+
+/// Parses a DNS RR starting at the given offset and returns the end offset, RR slice, type, and expanded name.
+fn parse_rr(packet: &[u8], start: usize) -> io::Result<(usize, Vec<u8>, u16)> {
+    let mut off = skip_name(packet, start)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "Invalid RR name"))?;
+
+    if off + 10 > packet.len() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "RR header truncated",
+        ));
+    }
+
+    let rr_type = u16::from_be_bytes([packet[off], packet[off + 1]]);
+    let rdlength = u16::from_be_bytes([packet[off + 8], packet[off + 9]]) as usize;
+
+    off += 10;
+
+    if off + rdlength > packet.len() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "RR data truncated",
+        ));
+    }
+
+    let rr_end = off + rdlength;
+
+    Ok((rr_end, packet[start..rr_end].to_vec(), rr_type))
 }
