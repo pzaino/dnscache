@@ -1,10 +1,10 @@
 /*
  * DNS Cache Server
  *
- * Copyright (c) 2026 Paolo Fabio Zaino
+ * Copyright (c) 2026 Paolo Fabio Zaino, all rights reserved.
  *
- * This Source Code Form is subject to the terms of the Mozilla Public
- * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * This Source Code is subject to the terms of the Mozilla Public
+ * License, v2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/.
  *
  * SPDX-License-Identifier: MPL-2.0
@@ -29,8 +29,7 @@ use std::net::IpAddr;
 use crate::config::Config;
 use crate::dns;
 
-use rand::RngCore;
-use rand::rngs::OsRng;
+use rand;
 
 pub const MAX_PACKET_SIZE: usize = 4096;
 pub const DEFAULT_TTL_SECS: u32 = 300;
@@ -866,7 +865,9 @@ impl DnsCacheServer {
 
 fn generate_txid() -> [u8; 2] {
     let mut bytes = [0u8; 2];
-    OsRng.fill_bytes(&mut bytes);
+
+    rand::fill(&mut bytes);
+
     bytes
 }
 
